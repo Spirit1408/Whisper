@@ -3,6 +3,8 @@
 
 # Runtime artifacts
 app.log
+state.json
+history.json
 
 # Python cache
 __pycache__/

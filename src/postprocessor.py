@@ -31,6 +31,16 @@ class PostProcessor:
         self.timeout = timeout_seconds
         self.enabled = False
 
+    def check_server(self) -> bool:
+        """Return True if the LM Studio server is reachable."""
+        try:
+            response = requests.get(f"{self.base_url}/models", timeout=2)
+            response.raise_for_status()
+            return True
+        except requests.RequestException as e:
+            logger.info("LM Studio server unreachable: %s", e)
+            return False
+
     def process(self, text: str) -> str:
         """Return cleaned text, or the original text if disabled or LM Studio fails."""
         if not self.enabled or not text:

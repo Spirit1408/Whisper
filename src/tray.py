@@ -1,79 +1,76 @@
-"""System tray icon with state indication and a context menu."""
+"""System tray icon (Qt) with state indication and a minimal context menu."""
 
 from __future__ import annotations
 
 import logging
 from typing import Callable
 
-import pystray
-from PIL import Image, ImageDraw
+from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 logger = logging.getLogger(__name__)
 
 STATE_COLORS = {
-    "idle": (100, 160, 220),       # blue
-    "recording": (220, 60, 60),    # red
-    "processing": (240, 170, 50),  # orange
+    "idle": QColor(100, 160, 220),       # blue
+    "recording": QColor(220, 60, 60),    # red
+    "processing": QColor(240, 170, 50),  # orange
 }
 
 
-def _make_icon(color: tuple[int, int, int], size: int = 64) -> Image.Image:
-    """Draw a filled circle with a small mic-like rectangle."""
-    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    draw.ellipse([2, 2, size - 2, size - 2], fill=color + (255,))
-    # simple mic glyph
+def _make_icon(color: QColor, size: int = 64) -> QIcon:
+    """Draw a filled circle with a small mic glyph."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QBrush(color))
+    painter.setPen(Qt.NoPen)
+    painter.drawEllipse(2, 2, size - 4, size - 4)
+
+    white = QColor(255, 255, 255)
+    painter.setBrush(QBrush(white))
     cx = size // 2
-    draw.rounded_rectangle([cx - 7, 14, cx + 7, 36], radius=7, fill=(255, 255, 255, 255))
-    draw.arc([cx - 13, 22, cx + 13, 44], start=0, end=180, fill=(255, 255, 255, 255), width=4)
-    draw.line([cx, 44, cx, 52], fill=(255, 255, 255, 255), width=4)
-    return image
+    painter.drawRoundedRect(QRect(cx - 7, 14, 14, 22), 7, 7)
+    pen = QPen(white, 4)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    painter.drawArc(QRect(cx - 13, 22, 26, 22), 180 * 16, 180 * 16)
+    painter.drawLine(QPoint(cx, 44), QPoint(cx, 52))
+    painter.end()
+    return QIcon(pixmap)
 
 
-class TrayApp:
-    """Tray icon. Call run() on the main thread; it blocks until quit."""
+class TrayIcon(QSystemTrayIcon):
+    """Tray icon: double-click shows the window, menu has Show / Quit."""
 
-    def __init__(
-        self,
-        postprocess_enabled: bool,
-        on_toggle_postprocess: Callable[[bool], None],
-        on_quit: Callable[[], None],
-    ):
-        self._postprocess_enabled = postprocess_enabled
-        self._on_toggle_postprocess = on_toggle_postprocess
-        self._on_quit = on_quit
+    def __init__(self, on_show: Callable[[], None], on_quit: Callable[[], None]):
         self._icons = {state: _make_icon(color) for state, color in STATE_COLORS.items()}
+        super().__init__(self._icons["idle"])
+        self.setToolTip("Dictation: idle")
 
-        menu = pystray.Menu(
-            pystray.MenuItem(
-                "LM Studio post-processing",
-                self._toggle_postprocess,
-                checked=lambda item: self._postprocess_enabled,
-            ),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", self._quit),
-        )
-        self.icon = pystray.Icon("whisper-dictation", self._icons["idle"], "Dictation: idle", menu)
+        menu = QMenu()
+        show_action = QAction("Show window", menu)
+        show_action.triggered.connect(on_show)
+        menu.addAction(show_action)
+        menu.addSeparator()
+        quit_action = QAction("Quit", menu)
+        quit_action.triggered.connect(on_quit)
+        menu.addAction(quit_action)
+        self.setContextMenu(menu)
 
-    def _toggle_postprocess(self, icon, item) -> None:
-        self._postprocess_enabled = not self._postprocess_enabled
-        self._on_toggle_postprocess(self._postprocess_enabled)
+        self._on_show = on_show
+        self.activated.connect(self._on_activated)
 
-    def _quit(self, icon, item) -> None:
-        self._on_quit()
-        self.icon.stop()
+    def _on_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._on_show()
 
     def set_state(self, state: str) -> None:
         """state: idle | recording | processing"""
         if state in self._icons:
-            self.icon.icon = self._icons[state]
-            self.icon.title = f"Dictation: {state}"
+            self.setIcon(self._icons[state])
+            self.setToolTip(f"Dictation: {state}")
 
     def notify(self, message: str) -> None:
-        try:
-            self.icon.notify(message, "Dictation")
-        except Exception:
-            logger.debug("Tray notification failed", exc_info=True)
-
-    def run(self) -> None:
-        self.icon.run()
+        self.showMessage("Dictation", message, QSystemTrayIcon.Information, 3000)
