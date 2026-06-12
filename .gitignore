@@ -1,0 +1,12 @@
+# Virtual environment
+.venv/
+
+# Runtime artifacts
+app.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local session notes
+CURRENT_SESSION_TASKS.md

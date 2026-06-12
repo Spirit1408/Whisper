@@ -1,0 +1,28 @@
+# Push-to-talk hotkey (keyboard library syntax). Examples: "ctrl+windows", "ctrl+alt", "f9"
+hotkey: "ctrl+windows"
+
+# Whisper model settings
+model:
+  name: "large-v3-turbo"      # large-v3-turbo | large-v3 | medium | small
+  device: "cuda"              # cuda | cpu
+  compute_type: "int8_float16" # int8_float16 | float16 | int8
+
+# Transcription language: "auto" | "ru" | "en"
+language: "auto"
+
+audio:
+  device: null         # null = default microphone; or device index/name (see sounddevice)
+  sample_rate: 16000
+
+# Recordings shorter than this are discarded (accidental key presses)
+min_record_seconds: 0.3
+
+# LM Studio post-processing (punctuation cleanup, filler word removal)
+postprocess:
+  enabled: false
+  base_url: "http://localhost:1234/v1"
+  model: ""            # empty = whatever model is loaded in LM Studio
+  timeout_seconds: 10
+
+# Beep on recording start/stop
+sounds: true
