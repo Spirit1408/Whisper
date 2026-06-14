@@ -10,6 +10,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 import autostart
+from audio_recorder import list_input_devices
 from history import HistoryStore
 from settings import SettingsStore
 
@@ -80,6 +82,18 @@ QPushButton#recheck {
     padding: 2px 8px; font-size: 13px;
 }
 QLabel#status { color: #777; font-size: 11px; }
+QComboBox {
+    background-color: #2d2d2d;
+    border: 1px solid #3c3c3c;
+    border-radius: 6px;
+    padding: 5px 10px;
+}
+QComboBox::drop-down { border: none; width: 24px; }
+QComboBox QAbstractItemView {
+    background-color: #2d2d2d;
+    border: 1px solid #3c3c3c;
+    selection-background-color: #264f78;
+}
 """
 
 
@@ -154,6 +168,7 @@ class MainWindow(QWidget):
 
     lm_toggle_requested = Signal(bool)
     lm_recheck_requested = Signal()
+    device_changed = Signal(object)  # device name (str) or None for system default
 
     def __init__(self, settings: SettingsStore, history: HistoryStore):
         super().__init__()
@@ -199,6 +214,23 @@ class MainWindow(QWidget):
         lm_row.addStretch()
         root.addLayout(lm_row)
 
+        # Microphone selector
+        mic_row = QHBoxLayout()
+        self.mic_combo = QComboBox()
+        self.mic_combo.setToolTip("Audio capture device")
+        mic_row.addWidget(self.mic_combo, stretch=1)
+
+        mic_refresh_btn = QPushButton("\u27f3")
+        mic_refresh_btn.setObjectName("recheck")
+        mic_refresh_btn.setFixedWidth(30)
+        mic_refresh_btn.setToolTip("Refresh device list")
+        mic_refresh_btn.clicked.connect(self._populate_devices)
+        mic_row.addWidget(mic_refresh_btn)
+        root.addLayout(mic_row)
+
+        self._populate_devices()
+        self.mic_combo.currentIndexChanged.connect(self._on_device_selected)
+
         # Editable text field
         self.text_edit = QPlainTextEdit()
         self.text_edit.setPlaceholderText("Transcribed text appears here for manual editing\u2026")
@@ -230,6 +262,27 @@ class MainWindow(QWidget):
         self.cards_layout.addStretch()
         scroll.setWidget(container)
         root.addWidget(scroll, stretch=1)
+
+    # --- microphone selector ----------------------------------------------
+
+    def _populate_devices(self) -> None:
+        """Fill the combobox with input devices, keeping the saved selection."""
+        saved = self.settings.get("audio_device")
+        self.mic_combo.blockSignals(True)
+        self.mic_combo.clear()
+        self.mic_combo.addItem("System default microphone", None)
+        for _idx, name in list_input_devices():
+            self.mic_combo.addItem(name, name)
+        if saved:
+            pos = self.mic_combo.findData(saved)
+            if pos >= 0:
+                self.mic_combo.setCurrentIndex(pos)
+        self.mic_combo.blockSignals(False)
+
+    def _on_device_selected(self, _index: int) -> None:
+        name = self.mic_combo.currentData()
+        self.settings.set("audio_device", name)
+        self.device_changed.emit(name)
 
     # --- history ----------------------------------------------------------
 

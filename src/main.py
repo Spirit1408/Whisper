@@ -9,7 +9,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
-from audio_recorder import AudioRecorder
+from audio_recorder import AudioRecorder, resolve_device
 from config import load_config
 from gui import GuiBridge, MainWindow
 from history import HistoryStore
@@ -55,9 +55,12 @@ class DictationApp:
         self.settings = SettingsStore()
         self.history = HistoryStore()
 
+        # GUI selection (state.json) wins over config.yaml; both fall back to default
+        saved_device = self.settings.get("audio_device")
+        device = resolve_device(saved_device) if saved_device else self.config.audio.device
         self.recorder = AudioRecorder(
             sample_rate=self.config.audio.sample_rate,
-            device=self.config.audio.device,
+            device=device,
         )
         self.inserter = TextInserter()
         self.postprocessor = PostProcessor(
@@ -76,6 +79,7 @@ class DictationApp:
         self.bridge.lm_status.connect(self.window.set_lm_available)
         self.window.lm_toggle_requested.connect(self._on_toggle_postprocess)
         self.window.lm_recheck_requested.connect(self._check_lm_server)
+        self.window.device_changed.connect(self._on_device_changed)
 
         # Heavy import deferred so the UI shows up while the model loads
         self.transcriber = None
@@ -131,6 +135,10 @@ class DictationApp:
     def _on_toggle_postprocess(self, enabled: bool) -> None:
         self.postprocessor.enabled = enabled
         logger.info("Post-processing %s", "enabled" if enabled else "disabled")
+
+    def _on_device_changed(self, name: str | None) -> None:
+        self.recorder.device = resolve_device(name)
+        logger.info("Capture device set to: %s", name or "system default")
 
     # --- dictation flow ------------------------------------------------
 

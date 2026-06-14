@@ -12,6 +12,8 @@ cleanup via a local LLM in [LM Studio](https://lmstudio.ai/).
 - GPU transcription (CUDA, `large-v3-turbo` by default, ~1.5 GB VRAM)
 - Dark-themed GUI: editable transcription field, Copy/Clear, history cards
   (click a card to load its text, hover to delete)
+- Microphone selector with a refresh button — switch the capture device on the fly;
+  the choice persists and overrides `audio.device` from `config.yaml`
 - Optional punctuation/filler-word cleanup via LM Studio (checkbox with automatic
   server availability check and a manual re-check button)
 - "Start with Windows" checkbox (managed via the HKCU Run registry key)

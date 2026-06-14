@@ -11,6 +11,47 @@ import sounddevice as sd
 logger = logging.getLogger(__name__)
 
 
+def list_input_devices() -> list[tuple[int, str]]:
+    """Return unique input devices as (index, name).
+
+    On Windows each physical device is reported by several host APIs
+    (MME, DirectSound, WASAPI, WDM-KS); MME indices are kept because
+    they reliably support arbitrary sample rates (unlike WASAPI which
+    may reject 16000 Hz). Falls back to name-based deduplication on
+    other platforms. Virtual/remap devices are filtered out.
+    """
+    devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+
+    mme: list[tuple[int, str]] = []
+    by_name: dict[str, int] = {}
+    for idx, dev in enumerate(devices):
+        if dev["max_input_channels"] < 1:
+            continue
+        name = dev["name"].strip()
+        api = hostapis[dev["hostapi"]]["name"]
+        if "MME" in api:
+            if "переназначение" in name.lower() or "remap" in name.lower():
+                continue
+            mme.append((idx, name))
+        by_name.setdefault(name, idx)
+
+    if mme:
+        return mme
+    return [(idx, name) for name, idx in by_name.items()]
+
+
+def resolve_device(name: str | None) -> int | None:
+    """Map a saved device name to a current device index (None = default)."""
+    if not name:
+        return None
+    for idx, dev_name in list_input_devices():
+        if dev_name == name:
+            return idx
+    logger.warning("Saved audio device '%s' not found, using default", name)
+    return None
+
+
 class AudioRecorder:
     """Records 16 kHz mono float32 audio from the microphone."""
 
@@ -48,7 +89,8 @@ class AudioRecorder:
             callback=self._callback,
         )
         self._stream.start()
-        logger.debug("Recording started")
+        device_info = sd.query_devices(self._stream.device, "input")
+        logger.info("Recording started (device: %s)", device_info["name"])
 
     def stop(self) -> np.ndarray:
         """Stop capturing and return the recorded audio as float32 mono array."""

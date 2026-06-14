@@ -28,6 +28,10 @@ System-wide push-to-talk dictation app for Windows. Fully local: faster-whisper 
   quit only via tray menu
 - Autostart via HKCU Run registry key (`src/autostart.py`), checkbox reflects
   actual registry state; old .bat/.lnk approach removed
+- Mic selector: MME device enumeration (WASAPI indices reject 16000 Hz),
+  device name persisted in state.json, resolved to MME index at runtime;
+  priority: GUI selection > config.yaml > system default; live switching (stream
+  is created per recording)
 - Clipboard paste chosen over char-by-char typing for reliable Cyrillic input
 - cuBLAS/cuDNN DLLs come from pip packages (`nvidia-*-cu12`), registered via
   `os.add_dll_directory` in `src/transcriber.py`
@@ -39,7 +43,8 @@ System-wide push-to-talk dictation app for Windows. Fully local: faster-whisper 
       Copy/Clear, history cards (click → field, hover → delete), close-to-tray
 - [x] Persistence: state.json (checkboxes), history.json (50 entries cap)
 - [x] GUI verified live: dictation → history, autostart toggle writes registry
-- [ ] LM Studio post-processing live test
+- [x] Mic selector combobox (+ ⟳ refresh) verified live: switching works on the fly
+- [x] LM Studio post-processing works (checkbox restores on startup when server up)
 
 ## Important Files & Modules
 
@@ -48,7 +53,7 @@ System-wide push-to-talk dictation app for Windows. Fully local: faster-whisper 
 - `src/tray.py` — `TrayIcon` (QSystemTrayIcon), state colors, Show/Quit menu
 - `src/transcriber.py` — faster-whisper wrapper, NVIDIA DLL setup, silence filter
 - `src/hotkey.py` — `PushToTalkHotkey`, combo press/release tracking
-- `src/audio_recorder.py` — mic capture into numpy buffer
+- `src/audio_recorder.py` — mic capture, `list_input_devices()`, `resolve_device()`
 - `src/text_inserter.py` — clipboard paste with restore
 - `src/postprocessor.py` — LM Studio cleanup with fallback + `check_server()`
 - `src/settings.py` / `src/history.py` / `src/autostart.py` — persistence & registry
