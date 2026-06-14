@@ -74,7 +74,8 @@ class DictationApp:
         self.window = MainWindow(self.settings, self.history)
         self.tray = TrayIcon(on_show=self.window.show_and_raise, on_quit=self._on_quit)
 
-        self.bridge.state_changed.connect(self.tray.set_state)
+        self.bridge.status_changed.connect(self.tray.set_state)
+        self.bridge.status_changed.connect(self.window.set_status)
         self.bridge.transcribed.connect(self.window.add_transcription)
         self.bridge.lm_status.connect(self.window.set_lm_available)
         self.window.lm_toggle_requested.connect(self._on_toggle_postprocess)
@@ -147,7 +148,7 @@ class DictationApp:
             return
         if self.config.sounds:
             beep(start=True)
-        self.bridge.state_changed.emit("recording")
+        self.bridge.status_changed.emit("listening")
         self.recorder.start()
 
     def _on_hotkey_release(self) -> None:
@@ -160,7 +161,7 @@ class DictationApp:
         duration = len(audio) / self.config.audio.sample_rate
         if duration < self.config.min_record_seconds:
             logger.debug("Recording too short (%.2f s), ignored", duration)
-            self.bridge.state_changed.emit("idle")
+            self.bridge.status_changed.emit("idle")
             return
 
         threading.Thread(target=self._process, args=(audio,), daemon=True).start()
@@ -169,7 +170,7 @@ class DictationApp:
         if not self._busy.acquire(blocking=False):
             return
         try:
-            self.bridge.state_changed.emit("processing")
+            self.bridge.status_changed.emit("processing")
             text = self.transcriber.transcribe(audio)
             if text:
                 text = self.postprocessor.process(text)
@@ -178,7 +179,7 @@ class DictationApp:
         except Exception:
             logger.exception("Processing failed")
         finally:
-            self.bridge.state_changed.emit("idle")
+            self.bridge.status_changed.emit("idle")
             self._busy.release()
 
 

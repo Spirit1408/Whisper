@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QStatusBar,
     QVBoxLayout,
     QWidget,
 )
@@ -101,7 +102,7 @@ class GuiBridge(QObject):
     """Thread-safe bridge: worker threads emit, GUI thread receives."""
 
     transcribed = Signal(str)
-    state_changed = Signal(str)  # idle | recording | processing
+    status_changed = Signal(str)  # idle | listening | processing
     lm_status = Signal(bool)
 
 
@@ -263,6 +264,13 @@ class MainWindow(QWidget):
         scroll.setWidget(container)
         root.addWidget(scroll, stretch=1)
 
+        # Status bar
+        self.status_bar = QStatusBar()
+        self.status_bar.setObjectName("status")
+        self.status_bar.setFixedHeight(20)
+        self.set_status("idle")
+        root.addWidget(self.status_bar)
+
     # --- microphone selector ----------------------------------------------
 
     def _populate_devices(self) -> None:
@@ -366,6 +374,23 @@ class MainWindow(QWidget):
             return
         event.ignore()
         self.hide()
+
+    def set_status(self, status: str) -> None:
+        """Update status bar text and color."""
+        colors = {
+            "idle": "#777",
+            "listening": "#4a90d9",
+            "processing": "#d9a34a",
+        }
+        labels = {
+            "idle": "Idle",
+            "listening": "Listening...",
+            "processing": "Processing...",
+        }
+        color = colors.get(status, "#777")
+        text = labels.get(status, status)
+        self.status_bar.setStyleSheet(f'QStatusBar {{ color: {color}; }}')
+        self.status_bar.showMessage(text)
 
     def show_and_raise(self) -> None:
         self.show()
