@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 STATE_COLORS = {
     "idle": QColor(100, 160, 220),       # blue
-    "recording": QColor(220, 60, 60),    # red
+    "listening": QColor(220, 60, 60),    # red
     "processing": QColor(240, 170, 50),  # orange
 }
 
