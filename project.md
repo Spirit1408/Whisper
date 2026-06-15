@@ -35,6 +35,9 @@ System-wide push-to-talk dictation app for Windows. Fully local: faster-whisper 
 - Clipboard paste chosen over char-by-char typing for reliable Cyrillic input
 - cuBLAS/cuDNN DLLs come from pip packages (`nvidia-*-cu12`), registered via
   `os.add_dll_directory` in `src/transcriber.py`
+- Single-instance lock via `QLockFile` in `%TEMP%/whisper_dictation.lock` (stale
+  timeout 5 s) — second launch shows a notice and exits; prevents duplicate
+  hotkey handling, double recording and double text insertion
 
 ## Current Status & Roadmap
 

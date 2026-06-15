@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QLockFile
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from audio_recorder import AudioRecorder, resolve_device
 from config import load_config
@@ -186,4 +188,18 @@ class DictationApp:
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    # Prevent multiple instances: stale locks older than 5 s are auto-removed
+    lock_path = Path(tempfile.gettempdir()) / "whisper_dictation.lock"
+    lock_file = QLockFile(str(lock_path))
+    lock_file.setStaleLockTime(5000)
+    if not lock_file.tryLock(100):
+        logger.warning("Another instance is already running, exiting")
+        QMessageBox.information(
+            None,
+            "Whisper Dictation",
+            "Приложение уже запущено.\nПроверьте иконку в трее.",
+        )
+        sys.exit(0)
+
     sys.exit(DictationApp(app).run())
