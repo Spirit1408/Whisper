@@ -103,7 +103,9 @@ class GuiBridge(QObject):
 
     transcribed = Signal(str)
     status_changed = Signal(str)  # idle | listening | processing
-    lm_status = Signal(bool)
+    lm_progress = Signal(str)          # transient status text shown next to the button
+    lm_models = Signal(list, object)   # (available [(key, name)], loaded_key | None)
+    lm_ready = Signal(bool, object)    # (model_loaded, loaded_key | None)
 
 
 class HistoryCard(QFrame):
@@ -168,7 +170,8 @@ class MainWindow(QWidget):
     """Dark-themed main window. Closing hides to tray instead of quitting."""
 
     lm_toggle_requested = Signal(bool)
-    lm_recheck_requested = Signal()
+    lm_ensure_requested = Signal()       # refresh clicked: bring LM Studio to ready state
+    lm_model_changed = Signal(str)       # user picked a model key in the dropdown
     device_changed = Signal(object)  # device name (str) or None for system default
 
     def __init__(self, settings: SettingsStore, history: HistoryStore):
@@ -205,8 +208,8 @@ class MainWindow(QWidget):
         self.lm_recheck_btn = QPushButton("\u27f3")
         self.lm_recheck_btn.setObjectName("recheck")
         self.lm_recheck_btn.setFixedWidth(30)
-        self.lm_recheck_btn.setToolTip("Re-check LM Studio server")
-        self.lm_recheck_btn.clicked.connect(self._on_recheck_clicked)
+        self.lm_recheck_btn.setToolTip("Start LM Studio server and load a model")
+        self.lm_recheck_btn.clicked.connect(self._on_ensure_clicked)
         lm_row.addWidget(self.lm_recheck_btn)
 
         self.lm_status_label = QLabel("checking\u2026")
@@ -214,6 +217,15 @@ class MainWindow(QWidget):
         lm_row.addWidget(self.lm_status_label)
         lm_row.addStretch()
         root.addLayout(lm_row)
+
+        # LM Studio model selector (enabled once the server is ready)
+        self.lm_model_combo = QComboBox()
+        self.lm_model_combo.setToolTip("LM Studio model used for post-processing")
+        self.lm_model_combo.setEnabled(False)
+        self._lm_has_models = False
+        self.lm_model_combo.addItem("No model loaded", None)
+        self.lm_model_combo.currentIndexChanged.connect(self._on_lm_model_selected)
+        root.addWidget(self.lm_model_combo)
 
         # Microphone selector
         mic_row = QHBoxLayout()
@@ -341,24 +353,65 @@ class MainWindow(QWidget):
         self.settings.set("lm_studio", checked)
         self.lm_toggle_requested.emit(checked)
 
-    def _on_recheck_clicked(self) -> None:
-        self.lm_status_label.setText("checking\u2026")
-        self.lm_recheck_requested.emit()
+    def _on_ensure_clicked(self) -> None:
+        """Refresh clicked: start the server and load a model in the background."""
+        self._set_lm_busy("checking...")
+        self.lm_ensure_requested.emit()
 
-    def set_lm_available(self, available: bool) -> None:
-        """Update LM Studio checkbox according to server availability."""
-        self.lm_cb.blockSignals(True)
+    def _on_lm_model_selected(self, _index: int) -> None:
+        """User picked a model in the dropdown - request a load."""
+        key = self.lm_model_combo.currentData()
+        if key is None:
+            return
+        self._set_lm_busy("loading...")
+        self.lm_model_changed.emit(key)
+
+    def _set_lm_busy(self, text: str) -> None:
+        """Lock LM Studio controls while a background operation runs."""
+        self.lm_recheck_btn.setEnabled(False)
+        self.lm_model_combo.setEnabled(False)
+        self.lm_cb.setEnabled(False)
+        self.lm_status_label.setText(text)
+
+    def set_lm_progress(self, text: str) -> None:
+        """Show transient progress text emitted by the worker thread."""
+        self.lm_status_label.setText(text)
+
+    def set_lm_models(self, available: list, loaded_key) -> None:
+        """Populate the model dropdown without triggering a load."""
+        self._lm_has_models = bool(available)
+        self.lm_model_combo.blockSignals(True)
+        self.lm_model_combo.clear()
         if available:
+            for key, name in available:
+                self.lm_model_combo.addItem(name, key)
+            pos = self.lm_model_combo.findData(loaded_key) if loaded_key else -1
+            if pos >= 0:
+                self.lm_model_combo.setCurrentIndex(pos)
+        else:
+            self.lm_model_combo.addItem("No models found", None)
+        self.lm_model_combo.blockSignals(False)
+
+    def set_lm_ready(self, model_loaded: bool, loaded_key) -> None:
+        """Re-enable controls and reflect the final readiness state."""
+        self.lm_recheck_btn.setEnabled(True)
+        self.lm_model_combo.setEnabled(self._lm_has_models)
+        if loaded_key:
+            self.lm_model_combo.blockSignals(True)
+            pos = self.lm_model_combo.findData(loaded_key)
+            if pos >= 0:
+                self.lm_model_combo.setCurrentIndex(pos)
+            self.lm_model_combo.blockSignals(False)
+        self.lm_cb.blockSignals(True)
+        if model_loaded:
             self.lm_cb.setEnabled(True)
             self.lm_cb.setChecked(bool(self.settings.get("lm_studio", False)))
-            self.lm_status_label.setText("server online")
+            self.lm_status_label.setText("ready")
         else:
             self.lm_cb.setChecked(False)
             self.lm_cb.setEnabled(False)
-            self.lm_status_label.setText("server offline")
         self.lm_cb.blockSignals(False)
-        # Apply the effective state to the pipeline
-        self.lm_toggle_requested.emit(available and bool(self.settings.get("lm_studio", False)))
+        self.lm_toggle_requested.emit(model_loaded and bool(self.settings.get("lm_studio", False)))
 
     def _on_copy(self) -> None:
         text = self.text_edit.toPlainText()

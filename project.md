@@ -1,5 +1,9 @@
 # Project: Local Dictation (Whisper)
 
+> Исторические заметки о предыдущих фазах Local Dictation. Отметки проверок и прежние TODO
+> относятся к тому периоду. Актуальное описание реализации и цели находится в
+> [архитектуре](docs/ARCHITECTURE.md), утверждённые этапы — в [Roadmap](docs/ROADMAP.md).
+
 System-wide push-to-talk dictation app for Windows. Fully local: faster-whisper on GPU
 (RTX 4070 SUPER) + optional text cleanup via LM Studio.
 
@@ -21,8 +25,14 @@ System-wide push-to-talk dictation app for Windows. Fully local: faster-whisper 
 - Model loads once at startup with warm-up (dummy transcription) for low dictation latency
 - LM Studio is LLM-only (cannot do STT) — used solely for punctuation/filler cleanup,
   with graceful fallback to raw text on timeout/unavailability
-- LM Studio availability probed at startup (GET /v1/models, 2 s timeout); checkbox
-  disabled while server offline, manual ⟳ re-check button
+- LM Studio managed via the `lms` CLI (`src/lmstudio.py`); startup probe is
+  non-intrusive (GET /v1/models, 2 s). The ⟳ button brings LM Studio to a ready
+  state — `lms server start`, then `lms load <key> -y` if no LLM is loaded — and
+  only then enables the post-processing checkbox
+- LM Studio model dropdown lists downloaded LLMs (`lms ls`); selecting one loads it
+  (`lms load`, unloading other LLMs), persists as `lm_model` in state.json, and is
+  sent as the `model` field of cleanup requests; preference: state.json >
+  config.yaml > first loaded/available
 - Worker threads emit Qt signals via `GuiBridge` (thread-safe GUI updates)
 - Closing the window hides to tray (`closeEvent` + `really_quit` app property);
   quit only via tray menu
@@ -38,8 +48,9 @@ System-wide push-to-talk dictation app for Windows. Fully local: faster-whisper 
 - Single-instance lock via `QLockFile` in `%TEMP%/whisper_dictation.lock` (stale
   timeout 5 s) — second launch shows a notice and exits; prevents duplicate
   hotkey handling, double recording and double text insertion
+- Prompt Injection mitigation: wrap raw transcribed text in `<raw_text>...</raw_text>` XML-like tags, and explicitly forbid the post-processing LLM from executing instructions or answering questions found inside these tags. Added few-shot examples of commands and questions to reinforce formatting-only behavior.
 
-## Current Status & Roadmap
+## Previous implementation milestones
 
 - [x] Phases 1-4 done: dictation pipeline, tray, launch scripts, e2e tested (RU + EN)
 - [x] GUI (PySide6): dark window — autostart/LM checkboxes, editable text field,
@@ -48,6 +59,8 @@ System-wide push-to-talk dictation app for Windows. Fully local: faster-whisper 
 - [x] GUI verified live: dictation → history, autostart toggle writes registry
 - [x] Mic selector combobox (+ ⟳ refresh) verified live: switching works on the fly
 - [x] LM Studio post-processing works (checkbox restores on startup when server up)
+- [x] LM Studio ⟳ button starts the server + loads a model via `lms` CLI; model
+      dropdown lists/loads downloaded LLMs, selection persists in state.json
 
 ## Important Files & Modules
 
@@ -58,7 +71,10 @@ System-wide push-to-talk dictation app for Windows. Fully local: faster-whisper 
 - `src/hotkey.py` — `PushToTalkHotkey`, combo press/release tracking
 - `src/audio_recorder.py` — mic capture, `list_input_devices()`, `resolve_device()`
 - `src/text_inserter.py` — clipboard paste with restore
-- `src/postprocessor.py` — LM Studio cleanup with fallback + `check_server()`
+- `src/postprocessor.py` — LM Studio cleanup with fallback; `model` is set at
+  runtime from the selected LM Studio model
+- `src/lmstudio.py` — `LMStudioManager`: locate `lms` CLI, server status/start,
+  list/load/unload models (drives the ⟳ ensure-ready flow + model dropdown)
 - `src/settings.py` / `src/history.py` / `src/autostart.py` — persistence & registry
 - `config.yaml` — user settings
 
@@ -68,7 +84,7 @@ System-wide push-to-talk dictation app for Windows. Fully local: faster-whisper 
 - Whisper may hallucinate on silence — mitigated by RMS threshold + `vad_filter=True`
 - No settings UI yet (config file only)
 
-## Open Questions / TODO
+## Historical questions from the initial plan
 
 - Autostart with Windows (Phase 4)
 - Possibly a small history window of recent dictations

@@ -16,6 +16,7 @@ from config import load_config
 from gui import GuiBridge, MainWindow
 from history import HistoryStore
 from hotkey import PushToTalkHotkey
+from lmstudio import LMStudioManager
 from postprocessor import PostProcessor
 from settings import SettingsStore
 from text_inserter import TextInserter
@@ -70,6 +71,7 @@ class DictationApp:
             model=self.config.postprocess.model,
             timeout_seconds=self.config.postprocess.timeout_seconds,
         )
+        self.lm = LMStudioManager(base_url=self.config.postprocess.base_url)
 
         # Thread-safe bridge: worker threads emit, GUI thread reacts
         self.bridge = GuiBridge()
@@ -79,9 +81,12 @@ class DictationApp:
         self.bridge.status_changed.connect(self.tray.set_state)
         self.bridge.status_changed.connect(self.window.set_status)
         self.bridge.transcribed.connect(self.window.add_transcription)
-        self.bridge.lm_status.connect(self.window.set_lm_available)
+        self.bridge.lm_progress.connect(self.window.set_lm_progress)
+        self.bridge.lm_models.connect(self.window.set_lm_models)
+        self.bridge.lm_ready.connect(self.window.set_lm_ready)
         self.window.lm_toggle_requested.connect(self._on_toggle_postprocess)
-        self.window.lm_recheck_requested.connect(self._check_lm_server)
+        self.window.lm_ensure_requested.connect(self._ensure_lm_ready)
+        self.window.lm_model_changed.connect(self._on_lm_model_changed)
         self.window.device_changed.connect(self._on_device_changed)
 
         # Heavy import deferred so the UI shows up while the model loads
@@ -99,7 +104,7 @@ class DictationApp:
         self.tray.show()
         self.window.show()
         threading.Thread(target=self._load_model, daemon=True).start()
-        self._check_lm_server()
+        self._probe_lm()
         return self.qt_app.exec()
 
     def _load_model(self) -> None:
@@ -119,13 +124,103 @@ class DictationApp:
             logger.exception("Failed to load Whisper model")
             self.tray.notify(f"Model load failed: {e}")
 
-    def _check_lm_server(self) -> None:
-        """Probe LM Studio availability in the background, report via signal."""
+    def _preferred_model(self) -> str:
+        """Model key to prefer: saved selection > config > none."""
+        return self.settings.get("lm_model") or self.config.postprocess.model or ""
 
-        def probe() -> None:
-            self.bridge.lm_status.emit(self.postprocessor.check_server())
+    def _choose_loaded(self, loaded: list[str]) -> str | None:
+        """Pick which loaded LLM to use: the preferred one, else the first."""
+        if not loaded:
+            return None
+        preferred = self._preferred_model()
+        if preferred and preferred in loaded:
+            return preferred
+        return loaded[0]
 
-        threading.Thread(target=probe, daemon=True).start()
+    def _probe_lm(self) -> None:
+        """Reflect the current LM Studio state at startup without starting it."""
+
+        def worker() -> None:
+            if not self.lm.is_server_up():
+                self.bridge.lm_progress.emit("server offline")
+                self.bridge.lm_models.emit([], None)
+                self.bridge.lm_ready.emit(False, None)
+                return
+            available = self.lm.list_llms()
+            loaded_key = self._choose_loaded(self.lm.loaded_llms())
+            self.bridge.lm_models.emit(available, loaded_key)
+            if loaded_key:
+                self.postprocessor.model = loaded_key
+            else:
+                self.bridge.lm_progress.emit("no model loaded")
+            self.bridge.lm_ready.emit(bool(loaded_key), loaded_key)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ensure_lm_ready(self) -> None:
+        """Refresh clicked: start the server and load a model if needed."""
+
+        def worker() -> None:
+            if not self.lm.available:
+                up = self.lm.is_server_up()
+                self.bridge.lm_progress.emit("server online" if up else "lms CLI not found")
+                self.bridge.lm_models.emit([], None)
+                self.bridge.lm_ready.emit(up, None)
+                return
+
+            if not self.lm.is_server_up():
+                self.bridge.lm_progress.emit("starting server...")
+                self.lm.start_server()
+                if not self.lm.wait_for_server():
+                    self.bridge.lm_progress.emit("server failed to start")
+                    self.bridge.lm_models.emit([], None)
+                    self.bridge.lm_ready.emit(False, None)
+                    return
+
+            available = self.lm.list_llms()
+            loaded_key = self._choose_loaded(self.lm.loaded_llms())
+            self.bridge.lm_models.emit(available, loaded_key)
+
+            if loaded_key is None:
+                target = self._preferred_model()
+                if target not in {key for key, _ in available}:
+                    target = available[0][0] if available else ""
+                if not target:
+                    self.bridge.lm_progress.emit("no models available")
+                    self.bridge.lm_ready.emit(False, None)
+                    return
+                self.bridge.lm_progress.emit(f"loading {target}...")
+                if not self.lm.load_model(target):
+                    self.bridge.lm_progress.emit("model load failed")
+                    self.bridge.lm_ready.emit(False, None)
+                    return
+                loaded_key = target
+
+            self.postprocessor.model = loaded_key
+            self.settings.set("lm_model", loaded_key)
+            self.bridge.lm_models.emit(available, loaded_key)
+            self.bridge.lm_ready.emit(True, loaded_key)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_lm_model_changed(self, model_key: str) -> None:
+        """User picked a different model in the dropdown - load it."""
+
+        def worker() -> None:
+            if self.lm.available and model_key not in self.lm.loaded_llms():
+                self.bridge.lm_progress.emit(f"loading {model_key}...")
+                if not self.lm.load_model(model_key):
+                    self.bridge.lm_progress.emit("model load failed")
+                    loaded_key = self._choose_loaded(self.lm.loaded_llms())
+                    self.postprocessor.model = loaded_key or ""
+                    self.bridge.lm_ready.emit(bool(loaded_key), loaded_key)
+                    return
+                self.lm.unload_other_llms(keep=model_key)
+            self.postprocessor.model = model_key
+            self.settings.set("lm_model", model_key)
+            self.bridge.lm_ready.emit(True, model_key)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_quit(self) -> None:
         self.hotkey.stop()
