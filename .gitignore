@@ -3,6 +3,9 @@
 
 # Runtime artifacts
 app.log
+app-technical.log
+.dictation-*
+/build/m0-exe/
 state.json
 history.json
 

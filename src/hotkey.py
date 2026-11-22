@@ -42,7 +42,7 @@ class PushToTalkHotkey:
 
     def start(self) -> None:
         self._hook = keyboard.hook(self._handle_event)
-        logger.info("Push-to-talk hotkey active: %s", "+".join(sorted(self.combo)))
+        logger.info("hotkey_active")
 
     def stop(self) -> None:
         if self._hook is not None:
@@ -63,7 +63,7 @@ class PushToTalkHotkey:
                 try:
                     self.on_press()
                 except Exception:
-                    logger.exception("on_press callback failed")
+                    logger.error("hotkey_press_failed")
         elif event.event_type == keyboard.KEY_UP:
             self._pressed.discard(key)
             if self._active:
@@ -71,4 +71,4 @@ class PushToTalkHotkey:
                 try:
                     self.on_release()
                 except Exception:
-                    logger.exception("on_release callback failed")
+                    logger.error("hotkey_release_failed")

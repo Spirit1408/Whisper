@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 import requests
+from local_http import LocalEndpointError, request
 
 logger = logging.getLogger(__name__)
 
@@ -52,20 +53,13 @@ class PostProcessor:
         self.timeout = timeout_seconds
         self.enabled = False
 
-    def check_server(self) -> bool:
-        """Return True if the LM Studio server is reachable."""
-        try:
-            response = requests.get(f"{self.base_url}/models", timeout=2)
-            response.raise_for_status()
-            return True
-        except requests.RequestException as e:
-            logger.info("LM Studio server unreachable: %s", e)
-            return False
-
-    def process(self, text: str) -> str:
-        """Return cleaned text, or the original text if disabled or LM Studio fails."""
+    def process(self, text: str) -> tuple[str, str]:
+        """Return usable text and an outcome the window can show independently."""
         if not self.enabled or not text:
-            return text
+            return text, "Raw"
+        model = self.model
+        if not model:
+            return text, "Smart fallback (no selected model ready)"
         try:
             payload = {
                 "messages": [
@@ -75,20 +69,21 @@ class PostProcessor:
                 "temperature": 0.1,
                 "stream": False,
             }
-            if self.model:
-                payload["model"] = self.model
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            cleaned = response.json()["choices"][0]["message"]["content"].strip()
-            if not cleaned:
-                logger.warning("LM Studio returned empty text, using raw transcription")
-                return text
-            logger.info("Post-processed: %s", cleaned)
-            return cleaned
-        except (requests.RequestException, KeyError, IndexError, ValueError) as e:
-            logger.warning("Post-processing failed (%s), using raw transcription", e)
-            return text
+            payload["model"] = model
+            response = request("POST", self.base_url, "/v1/chat/completions",
+                               json=payload, timeout=self.timeout)
+            choice = response.json()["choices"][0]
+            cleaned = choice["message"]["content"]
+            if choice["finish_reason"] != "stop" or not isinstance(cleaned, str) or not cleaned.strip():
+                raise ValueError
+            return cleaned.strip(), "Smart"
+        except LocalEndpointError:
+            reason = "local endpoint required"
+        except requests.exceptions.JSONDecodeError:
+            reason = "invalid or incomplete response"
+        except requests.RequestException:
+            reason = "service unavailable"
+        except (ValueError, KeyError, TypeError, IndexError):
+            reason = "invalid or incomplete response"
+        logger.warning("smart_fallback: %s", reason)
+        return text, f"Smart fallback ({reason})"

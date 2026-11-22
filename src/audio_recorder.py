@@ -20,8 +20,12 @@ def list_input_devices() -> list[tuple[int, str]]:
     may reject 16000 Hz). Falls back to name-based deduplication on
     other platforms. Virtual/remap devices are filtered out.
     """
-    devices = sd.query_devices()
-    hostapis = sd.query_hostapis()
+    try:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    except (sd.PortAudioError, OSError):
+        logger.warning("mic_enumeration_failed")
+        return []
 
     mme: list[tuple[int, str]] = []
     by_name: dict[str, int] = {}
@@ -48,7 +52,7 @@ def resolve_device(name: str | None) -> int | None:
     for idx, dev_name in list_input_devices():
         if dev_name == name:
             return idx
-    logger.warning("Saved audio device '%s' not found, using default", name)
+    logger.warning("mic_selection_unavailable")
     return None
 
 
@@ -69,7 +73,7 @@ class AudioRecorder:
 
     def _callback(self, indata, frames, time_info, status) -> None:
         if status:
-            logger.warning("Audio stream status: %s", status)
+            logger.warning("audio_stream_status")
         with self._lock:
             if self._recording:
                 self._chunks.append(indata[:, 0].copy())
@@ -81,31 +85,33 @@ class AudioRecorder:
         with self._lock:
             self._chunks = []
             self._recording = True
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="float32",
-            device=self.device,
-            callback=self._callback,
-        )
-        self._stream.start()
-        device_info = sd.query_devices(self._stream.device, "input")
-        logger.info("Recording started (device: %s)", device_info["name"])
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate, channels=1, dtype="float32",
+                device=self.device, callback=self._callback,
+            )
+            self._stream.start()
+        except Exception:
+            with self._lock:
+                self._recording = False
+                self._chunks.clear()
+            stream, self._stream = self._stream, None
+            if stream is not None:
+                stream.close()
+            raise
+        logger.info("recording_started")
 
     def stop(self) -> np.ndarray:
         """Stop capturing and return the recorded audio as float32 mono array."""
         with self._lock:
             self._recording = False
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-        with self._lock:
-            audio = (
-                np.concatenate(self._chunks)
-                if self._chunks
-                else np.zeros(0, dtype=np.float32)
-            )
-            self._chunks = []
+            chunks, self._chunks = self._chunks, []
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+            finally:
+                stream.close()
+        audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
         logger.debug("Recording stopped: %.2f s", len(audio) / self.sample_rate)
         return audio

@@ -25,14 +25,18 @@ def _add_nvidia_dll_dirs() -> None:
             if bin_dir.exists():
                 os.add_dll_directory(str(bin_dir))
                 os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
-                logger.debug("Added DLL dir: %s", bin_dir)
         except ImportError:
             logger.debug("nvidia.%s not installed, skipping DLL dir setup", pkg)
 
 
 _add_nvidia_dll_dirs()
 
+# Disable SDK background traffic in the normal launcher as well as the probes.
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
 from faster_whisper import WhisperModel  # noqa: E402
+from faster_whisper.utils import download_model  # noqa: E402
 
 
 class Transcriber:
@@ -48,8 +52,21 @@ class Transcriber:
     ):
         self.language = None if language == "auto" else language
         self.sample_rate = sample_rate
-        logger.info("Loading Whisper model '%s' on %s (%s)...", model_name, device, compute_type)
-        self.model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        # A missing tokenizer makes Faster Whisper call Tokenizer.from_pretrained
+        # even when given a local model directory.
+        if str(model_name).startswith(("\\\\", "//")):
+            raise ValueError("A local model directory is required")
+        folder = Path(model_name)
+        if not folder.is_dir():
+            try:
+                folder = Path(download_model(model_name, local_files_only=True))
+            except (OSError, ValueError):
+                raise FileNotFoundError("Whisper model unavailable in local cache") from None
+        for name in ("model.bin", "tokenizer.json", "config.json"):
+            if not (folder / name).is_file():
+                raise FileNotFoundError("Incomplete local Whisper model")
+        self.model = WhisperModel(str(folder), device=device, compute_type=compute_type,
+                                  local_files_only=True)
         self._warmup()
         logger.info("Model loaded and warmed up")
 
@@ -68,12 +85,12 @@ class Transcriber:
             logger.debug("Audio below silence threshold (rms=%.5f), skipping", rms)
             return ""
 
-        segments, info = self.model.transcribe(
+        segments, _ = self.model.transcribe(
             audio,
             language=self.language,
             vad_filter=True,
             beam_size=5,
         )
         text = " ".join(segment.text.strip() for segment in segments).strip()
-        logger.info("Transcribed (%s, %.0f%%): %s", info.language, info.language_probability * 100, text)
+        logger.info("stt_complete chars=%d", len(text))
         return text

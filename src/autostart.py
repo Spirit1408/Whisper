@@ -41,7 +41,7 @@ def set_enabled(enabled: bool) -> bool:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
             if enabled:
                 winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, _command())
-                logger.info("Autostart enabled: %s", _command())
+                logger.info("autostart_enabled")
             else:
                 try:
                     winreg.DeleteValue(key, APP_NAME)
@@ -49,6 +49,6 @@ def set_enabled(enabled: bool) -> bool:
                     pass
                 logger.info("Autostart disabled")
         return True
-    except OSError as e:
-        logger.error("Failed to update autostart registry entry: %s", e)
+    except OSError:
+        logger.error("autostart_update_failed")
         return False

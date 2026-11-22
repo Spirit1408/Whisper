@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from json_store import write_json
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ class HistoryStore:
     def __init__(self, path: Path = HISTORY_PATH):
         self.path = path
         self.entries: list[dict] = []
+        self.writable = True
         self._load()
 
     def _load(self) -> None:
@@ -27,26 +29,23 @@ class HistoryStore:
         try:
             with open(self.path, encoding="utf-8") as f:
                 stored = json.load(f)
-            if isinstance(stored, list):
-                self.entries = stored[:MAX_ENTRIES]
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to load %s: %s", self.path.name, e)
+            if not isinstance(stored, list):
+                raise ValueError
+            self.entries = stored[:MAX_ENTRIES]
+        except (ValueError, OSError):
+            self.writable = False
+            logger.warning("history_read_failed")
 
-    def _save(self) -> None:
-        try:
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.entries, f, ensure_ascii=False, indent=2)
-        except OSError as e:
-            logger.error("Failed to save %s: %s", self.path.name, e)
+    def _save(self, entries: list[dict]) -> bool:
+        if not self.writable or not write_json(self.path, entries, logger):
+            return False
+        self.entries = entries
+        return True
 
-    def add(self, text: str) -> dict:
+    def add(self, text: str) -> dict | None:
         """Prepend a new entry and return it."""
         entry = {"id": f"{time.time():.6f}", "text": text, "ts": time.time()}
-        self.entries.insert(0, entry)
-        del self.entries[MAX_ENTRIES:]
-        self._save()
-        return entry
+        return entry if self._save([entry, *self.entries[:MAX_ENTRIES - 1]]) else None
 
-    def remove(self, entry_id: str) -> None:
-        self.entries = [e for e in self.entries if e.get("id") != entry_id]
-        self._save()
+    def remove(self, entry_id: str) -> bool:
+        return self._save([e for e in self.entries if e.get("id") != entry_id])

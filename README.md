@@ -1,7 +1,7 @@
 # Local Dictation (Whisper)
 
 System-wide push-to-talk dictation for Windows. Hold a hotkey, speak, release — the text
-is pasted into the currently focused window. Speech recognition runs locally via
+appears in the editor. Use **Copy**, then paste into the intended field. Speech recognition runs locally via
 [faster-whisper](https://github.com/SYSTRAN/faster-whisper) on your GPU, optional text
 cleanup via a local LLM in [LM Studio](https://lmstudio.ai/).
 
@@ -21,6 +21,8 @@ M1c — первый стабильный релиз с Raw и Smart. Исход
 | Как согласовывать и фиксировать изменения | [Правила для агентов](AGENTS.md) и [журнал изменений](CHANGELOG.md) |
 | Как восстановить рабочую версию Raw и Smart до изменений M0-B | [Снимок M0-A, версии и процедура проверки](docs/BASELINE.md) |
 
+Проверки текущей версии, измерения до/после и ручной smoke приведены в [результатах M0](docs/M0-RESULTS.md).
+
 ## Features
 
 - Push-to-talk global hotkey (default: `Ctrl+Win`)
@@ -37,7 +39,7 @@ M1c — первый стабильный релиз с Raw и Smart. Исход
 - Closing the window hides the app to tray; it keeps working. Quit via tray menu
 - Tray icon with state indication (blue = idle, red = recording, orange = processing)
 - Checkbox states and history persist between launches (`state.json`, `history.json`)
-- Paste attempts to restore previously copied plain text. A new copy made during paste or a non-text clipboard format may be lost.
+- Automatic paste is paused until a recipient can be verified. The clipboard changes only when you choose Copy.
 
 ## Requirements
 
@@ -54,19 +56,18 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-The current loader can contact the model hub and download missing weights (~1.6 GB for large-v3-turbo).
+Prepare the Whisper snapshot locally. Set `model.name` to a complete local model directory or a model already in the Hugging Face cache. A missing snapshot or tokenizer produces a startup notice.
 
 ## Run
 
 - **`run.bat`** — double-click, runs with a console window (good for debugging)
-- **`run_hidden.vbs`** — double-click, runs without a console; logs go to `app.log`
+- **`run_hidden.vbs`** — double-click, runs without a console; technical events go to `app-technical.log`
 - Manual: `.venv\Scripts\python.exe src\main.py`
 
 Autostart with Windows is toggled by the "Start with Windows" checkbox in the app
 window (it points the registry Run entry at `run_hidden.vbs`).
 
-Wait for the "Ready" tray notification (model loads in ~5-15 s), then hold `Ctrl+Win`
-and speak. Release to insert the text into the focused window.
+Wait for Ready, hold `Ctrl+Win`, speak and release. The window shows the result, the history-write outcome and the Copy action. If hidden, the app also sends a tray notification.
 
 ## LM Studio (optional, for post-processing only)
 
@@ -74,21 +75,9 @@ The app works fully without LM Studio — it is used only for text cleanup when 
 "LM Studio post-processing" checkbox is enabled. On startup the app does a
 non-intrusive probe; if the server is offline the checkbox stays disabled.
 
-Click the **⟳ button** to bring LM Studio to a ready state: it starts the local
-server (`lms server start`) and, if no LLM is loaded, loads one (`lms load`). Once a
-model is loaded the **model dropdown** activates and the checkbox is enabled. Pick a
-different model in the dropdown to load it on the fly — the choice is remembered in
-`state.json` and reused next time. If LM Studio goes down mid-session, the raw
-transcription is inserted silently.
+Click **⟳** to check the local service. With the CLI on the default loopback endpoint the app can start the server and load a downloaded model. Use the dropdown when several models are available. Smart becomes available once the chosen instance is reported as loaded. A failed or incomplete response leaves the raw transcription in the editor and shows **Smart fallback**.
 
-In the current implementation, switching models can unload other LLMs in the same LM Studio
-service. The current INFO log can also retain both the transcription and the edited text
-after a history card is deleted. M0 addresses these behaviours.
-
-This requires LM Studio's **`lms` CLI** (bundled with the desktop app; run
-`lms bootstrap` once if `lms` is not on your PATH). To have the server ready
-automatically at login instead, enable **Settings → Developer → "Local LLM Service
-(headless)"** and keep a model loaded (or enable **JIT model loading**).
+Switching models issues no unload command. If there is insufficient memory, choose a smaller local model or manage the shared service yourself. Inference accepts a loopback endpoint and disables HTTP redirects and environment proxies.
 
 ## Configuration
 

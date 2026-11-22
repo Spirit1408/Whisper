@@ -49,7 +49,7 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     """Load config.yaml, falling back to defaults for missing keys."""
     config = AppConfig()
     if not path.exists():
-        logger.warning("Config file %s not found, using defaults", path)
+        logger.warning("config_missing_using_defaults")
         return config
 
     with open(path, encoding="utf-8") as f:

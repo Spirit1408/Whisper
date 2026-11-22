@@ -101,11 +101,13 @@ QComboBox QAbstractItemView {
 class GuiBridge(QObject):
     """Thread-safe bridge: worker threads emit, GUI thread receives."""
 
-    transcribed = Signal(str)
+    transcribed = Signal(str, str)
+    notice = Signal(str)
     status_changed = Signal(str)  # idle | listening | processing
     lm_progress = Signal(str)          # transient status text shown next to the button
     lm_models = Signal(list, object)   # (available [(key, name)], loaded_key | None)
     lm_ready = Signal(bool, object)    # (model_loaded, loaded_key | None)
+    lm_selected = Signal(str)
 
 
 class HistoryCard(QFrame):
@@ -132,6 +134,7 @@ class HistoryCard(QFrame):
         layout.addLayout(header)
 
         text_label = QLabel(entry["text"])
+        text_label.setTextFormat(Qt.PlainText)
         text_label.setWordWrap(True)
         text_label.setTextInteractionFlags(Qt.NoTextInteraction)
         layout.addWidget(text_label)
@@ -173,6 +176,7 @@ class MainWindow(QWidget):
     lm_ensure_requested = Signal()       # refresh clicked: bring LM Studio to ready state
     lm_model_changed = Signal(str)       # user picked a model key in the dropdown
     device_changed = Signal(object)  # device name (str) or None for system default
+    notification = Signal(str)
 
     def __init__(self, settings: SettingsStore, history: HistoryStore):
         super().__init__()
@@ -249,6 +253,9 @@ class MainWindow(QWidget):
         self.text_edit.setPlaceholderText("Transcribed text appears here for manual editing\u2026")
         self.text_edit.setMinimumHeight(120)
         root.addWidget(self.text_edit)
+        self.result_label = QLabel("Automatic paste is paused. Use Copy after dictating.")
+        self.result_label.setWordWrap(True)
+        root.addWidget(self.result_label)
 
         # Copy / Clear buttons
         btn_row = QHBoxLayout()
@@ -318,9 +325,14 @@ class MainWindow(QWidget):
         index = 0 if prepend else self.cards_layout.count() - 1  # keep stretch last
         self.cards_layout.insertWidget(index, card)
 
-    def add_transcription(self, text: str) -> None:
+    def add_transcription(self, text: str, outcome: str) -> None:
         """Called (via signal) when a new dictation is transcribed."""
+        self.text_edit.setPlainText(text)
         entry = self.history.add(text)
+        saved = "saved" if entry is not None else "not saved to history"
+        self.show_notice(f"{outcome} · {saved}. Paste skipped. Use Copy.")
+        if entry is None:
+            return
         self._insert_card(entry, prepend=True)
         # Trim widgets beyond the store cap
         valid_ids = {e["id"] for e in self.history.entries}
@@ -338,8 +350,10 @@ class MainWindow(QWidget):
         self.text_edit.setPlainText(text)
 
     def _on_card_deleted(self, entry_id: str) -> None:
-        self.history.remove(entry_id)
-        self._remove_card_widget(entry_id)
+        if self.history.remove(entry_id):
+            self._remove_card_widget(entry_id)
+        else:
+            self.show_notice("History change could not be saved.")
 
     # --- checkboxes & buttons ----------------------------------------------
 
@@ -371,6 +385,7 @@ class MainWindow(QWidget):
         self.lm_recheck_btn.setEnabled(False)
         self.lm_model_combo.setEnabled(False)
         self.lm_cb.setEnabled(False)
+        self.lm_toggle_requested.emit(False)
         self.lm_status_label.setText(text)
 
     def set_lm_progress(self, text: str) -> None:
@@ -383,6 +398,8 @@ class MainWindow(QWidget):
         self.lm_model_combo.blockSignals(True)
         self.lm_model_combo.clear()
         if available:
+            if loaded_key is None:
+                self.lm_model_combo.addItem("Select a downloaded model", None)
             for key, name in available:
                 self.lm_model_combo.addItem(name, key)
             pos = self.lm_model_combo.findData(loaded_key) if loaded_key else -1
@@ -391,6 +408,10 @@ class MainWindow(QWidget):
         else:
             self.lm_model_combo.addItem("No models found", None)
         self.lm_model_combo.blockSignals(False)
+
+    def remember_lm_model(self, key: str) -> None:
+        if self.settings.get("lm_model") != key:
+            self.settings.set("lm_model", key)
 
     def set_lm_ready(self, model_loaded: bool, loaded_key) -> None:
         """Re-enable controls and reflect the final readiness state."""
@@ -416,7 +437,15 @@ class MainWindow(QWidget):
     def _on_copy(self) -> None:
         text = self.text_edit.toPlainText()
         if text:
-            QGuiApplication.clipboard().setText(text)
+            try:
+                QGuiApplication.clipboard().setText(text)
+            except (RuntimeError, OSError):
+                self.show_notice("Copy failed. The result is available in the editor.")
+
+    def show_notice(self, message: str) -> None:
+        self.result_label.setText(message)
+        if not self.isVisible() or self.isMinimized():
+            self.notification.emit(message)
 
     # --- window behavior ----------------------------------------------------
 

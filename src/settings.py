@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from json_store import write_json
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ class SettingsStore:
     def __init__(self, path: Path = STATE_PATH):
         self.path = path
         self._data: dict = dict(DEFAULTS)
+        self._writable = True
         self._load()
 
     def _load(self) -> None:
@@ -30,21 +32,17 @@ class SettingsStore:
         try:
             with open(self.path, encoding="utf-8") as f:
                 stored = json.load(f)
-            if isinstance(stored, dict):
-                self._data.update(stored)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to load %s: %s", self.path.name, e)
-
-    def _save(self) -> None:
-        try:
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2)
-        except OSError as e:
-            logger.error("Failed to save %s: %s", self.path.name, e)
+            if not isinstance(stored, dict):
+                raise ValueError
+            self._data.update(stored)
+        except (ValueError, OSError):
+            self._writable = False
+            logger.warning("settings_read_failed")
 
     def get(self, key: str, default=None):
         return self._data.get(key, default)
 
     def set(self, key: str, value) -> None:
         self._data[key] = value
-        self._save()
+        if self._writable:
+            write_json(self.path, self._data, logger)

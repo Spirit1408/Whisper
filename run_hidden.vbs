@@ -1,4 +1,4 @@
-' Launch the dictation app without a console window (logs go to app.log)
+' Launch the dictation app without a console window (logs go to app-technical.log)
 Set fso = CreateObject("Scripting.FileSystemObject")
 appDir = fso.GetParentFolderName(WScript.ScriptFullName)
 Set shell = CreateObject("WScript.Shell")
