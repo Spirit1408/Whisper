@@ -12,7 +12,7 @@ import logging
 import shutil
 import subprocess
 import sys
-import time
+import threading
 from pathlib import Path
 
 import requests
@@ -28,8 +28,9 @@ _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 class LMStudioManager:
     """Locate and control LM Studio via its `lms` command-line tool."""
 
-    def __init__(self, base_url: str = "http://localhost:1234/v1"):
+    def __init__(self, base_url: str = "http://localhost:1234/v1", closing=None):
         self.base_url = base_url.rstrip("/")
+        self._closing = closing if closing is not None else threading.Event()
         self._lms_path: str | None = None
         self._lms_searched = False
 
@@ -70,6 +71,8 @@ class LMStudioManager:
     # --- low-level CLI runner -----------------------------------------
 
     def _run(self, args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+        if self._closing.is_set():
+            return None
         # The CLI manages the default local service, not an arbitrary configured port.
         try:
             if local_base(self.base_url) != "http://127.0.0.1:1234/v1":
@@ -108,6 +111,8 @@ class LMStudioManager:
 
     def is_server_up(self) -> bool:
         """Quick HTTP probe of the OpenAI-compatible endpoint."""
+        if self._closing.is_set():
+            return False
         try:
             request("GET", self.base_url, "/v1/models", timeout=2)
             return True
@@ -119,7 +124,8 @@ class LMStudioManager:
         for _ in range(attempts):
             if self.is_server_up():
                 return True
-            time.sleep(interval)
+            if self._closing.wait(interval):
+                return False
         return self.is_server_up()
 
     def list_llms(self) -> list[tuple[str, str]]:
@@ -140,6 +146,8 @@ class LMStudioManager:
         if not isinstance(data, list):
             # /v1/models can include *unloaded* JIT candidates. Require an
             # explicit loaded state when there is no usable CLI response.
+            if self._closing.is_set():
+                return {}
             try:
                 packet = request("GET", self.base_url, "/api/v0/models", timeout=2).json()
                 return {m["id"]: m["id"] for m in packet["data"] if isinstance(m, dict)

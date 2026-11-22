@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from audio_recorder import AudioRecorder, resolve_device
 from config import load_config
+from dictation import Coordinator
 from gui import GuiBridge, MainWindow
 from history import HistoryStore
 from hotkey import PushToTalkHotkey
@@ -24,12 +26,17 @@ from tray import TrayIcon
 logger = logging.getLogger("main")
 
 
-def configure_logging() -> None:
+def configure_logging(directory=None) -> None:
     # Libraries may include recognized words, prompts or response URLs even at INFO.
     allowed = {"main", "transcriber", "audio_recorder", "history", "postprocessor",
                "lmstudio", "settings", "hotkey", "config", "autostart"}
-    handlers = [logging.FileHandler(Path(__file__).resolve().parents[1] / "app-technical.log",
-                                    encoding="utf-8")]
+    handlers = []
+    try:
+        log_dir = directory if directory is not None else Path(__file__).resolve().parents[1]
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_dir / "app-technical.log", encoding="utf-8"))
+    except OSError:
+        handlers.append(logging.NullHandler())
     if sys.stderr is not None:
         handlers.append(logging.StreamHandler())
     for handler in handlers:
@@ -50,17 +57,16 @@ def beep(start: bool) -> None:
 
 
 class DictationApp:
-    def __init__(self, qt_app: QApplication) -> None:
+    def __init__(self, qt_app: QApplication, *, database=None, legacy_dir=None) -> None:
         self.qt_app = qt_app
         self.config = load_config()
         logger.info("config_loaded")
 
-        self.settings = SettingsStore()
-        self.history = HistoryStore()
+        self.history = HistoryStore(database) if legacy_dir is None else HistoryStore(database, legacy_dir)
+        self.settings = SettingsStore(self.history)
 
-        # GUI selection (state.json) wins over config.yaml; both fall back to default
-        saved_device = self.settings.get("audio_device")
-        device = resolve_device(saved_device) if saved_device else self.config.audio.device
+        # A saved system-default choice (None) also overrides the configured device.
+        device = self.settings.get("audio_device", self.config.audio.device)
         self.recorder = AudioRecorder(
             sample_rate=self.config.audio.sample_rate,
             device=device,
@@ -70,11 +76,13 @@ class DictationApp:
             model=self.config.postprocess.model,
             timeout_seconds=self.config.postprocess.timeout_seconds,
         )
-        self.lm = LMStudioManager(base_url=self.config.postprocess.base_url)
+        self._closing = threading.Event()
+        self.lm = LMStudioManager(base_url=self.config.postprocess.base_url, closing=self._closing)
 
         # Thread-safe bridge: worker threads emit, GUI thread reacts
         self.bridge = GuiBridge()
-        self.window = MainWindow(self.settings, self.history)
+        self.jobs = Coordinator(self.history, self.bridge.transcribed.emit)
+        self.window = MainWindow(self.settings, self.history, self.jobs.ram_results)
         self.tray = TrayIcon(on_show=self.window.show_and_raise, on_quit=self._on_quit)
 
         self.bridge.status_changed.connect(self.tray.set_state)
@@ -90,6 +98,7 @@ class DictationApp:
         self.window.lm_ensure_requested.connect(self._ensure_lm_ready)
         self.window.lm_model_changed.connect(self._on_lm_model_changed)
         self.window.device_changed.connect(self._on_device_changed)
+        self.window.cancel_requested.connect(self._on_cancel)
 
         # Heavy import deferred so the UI shows up while the model loads
         self.transcriber = None
@@ -98,9 +107,9 @@ class DictationApp:
             on_press=self._on_hotkey_press,
             on_release=self._on_hotkey_release,
         )
-        self._busy = threading.Lock()
+        self._capture_job = None
+        self._worker = None
         self._capture_lock = threading.Lock()
-        self._closing = threading.Event()
 
     # --- lifecycle -----------------------------------------------------
 
@@ -110,7 +119,12 @@ class DictationApp:
         self.window._set_lm_busy("checking...")
         threading.Thread(target=self._load_model, daemon=True).start()
         self._probe_lm()
-        return self.qt_app.exec()
+        self.qt_app.aboutToQuit.connect(self._shutdown)
+        try:
+            return self.qt_app.exec()
+        finally:
+            self._shutdown()
+            self.qt_app.aboutToQuit.disconnect(self._shutdown)
 
     def _load_model(self) -> None:
         try:
@@ -239,18 +253,45 @@ class DictationApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_quit(self) -> None:
+    def _stop_capture(self):
+        job, self._capture_job = self._capture_job, None
+        if job is None:
+            return
+        try:
+            self.recorder.stop()
+        except Exception:
+            logger.warning("mic_quit_close_failed")
+        finally:
+            self.jobs.release(job)
+
+    def _on_cancel(self):
         with self._capture_lock:
+            if self.jobs.cancel():
+                self._stop_capture()
+                self.window.refresh_history()
+                self.bridge.notice.emit("Cancelled. Any saved Original is in history.")
+                state = "idle" if self._worker is None else "Waiting for cancelled backend"
+                self.bridge.status_changed.emit(state)
+
+    def _shutdown(self) -> None:
+        with self._capture_lock:
+            if self._closing.is_set():
+                return
             self._closing.set()
-            self.hotkey.stop()
-            if self.recorder.is_recording:
-                try:
-                    self.recorder.stop()
-                except Exception:
-                    logger.warning("mic_quit_close_failed")
-                finally:
-                    self._busy.release()
+            self.jobs.cancel(closing=True)
+            self._stop_capture()
+            try:
+                self.hotkey.stop()
+            except Exception:
+                logger.warning("hotkey_quit_close_failed")
+            worker = self._worker
+        if worker is not None:
+            worker.join(timeout=1.0)
+        self.history.close()
         logger.info("Shutting down")
+
+    def _on_quit(self) -> None:
+        self._shutdown()
         self.qt_app.setProperty("really_quit", True)
         self.window.close()
         self.tray.hide()
@@ -261,21 +302,27 @@ class DictationApp:
         logger.info("Post-processing %s", "enabled" if enabled else "disabled")
 
     def _on_device_changed(self, name: str | None) -> None:
-        self.recorder.device = resolve_device(name)
+        self.recorder.device = resolve_device(name, self.recorder.sample_rate)
         logger.info("mic_selection_changed")
 
     # --- dictation flow ------------------------------------------------
 
     def _on_hotkey_press(self) -> None:
         with self._capture_lock:
-            if self._closing.is_set() or self.transcriber is None or not self._busy.acquire(False):
+            if self._closing.is_set() or self.transcriber is None:
+                return
+            job = self.jobs.admit(self.postprocessor)
+            if job is None:
+                self.bridge.notice.emit("Busy. Release the hotkey and try again after processing.")
                 return
             try:
                 self.recorder.start()
             except Exception:
-                self._busy.release()
+                self.jobs.release(job)
                 self._mic_failed()
                 return
+            self._capture_job = job
+            self.jobs.started_capture(job)
             self.bridge.status_changed.emit("listening")
             if self.config.sounds:
                 beep(start=True)
@@ -287,60 +334,66 @@ class DictationApp:
 
     def _on_hotkey_release(self) -> None:
         with self._capture_lock:
-            if self._closing.is_set() or not self.recorder.is_recording:
+            job, self._capture_job = self._capture_job, None
+            if job is None:
                 return
             try:
                 audio = self.recorder.stop()
             except Exception:
-                self._busy.release()
+                self.jobs.finish_capture(job, "failed", "mic_stop_failed")
                 self._mic_failed()
                 return
-        if self.config.sounds:
-            beep(start=False)
-
-        duration = len(audio) / self.config.audio.sample_rate
-        if duration < self.config.min_record_seconds:
-            logger.debug("Recording too short (%.2f s), ignored", duration)
-            self.bridge.status_changed.emit("idle")
-            self._busy.release()
-            return
-
-        try:
-            threading.Thread(target=self._process, args=(audio,), kwargs={"reserved": True}, daemon=True).start()
-        except RuntimeError:
-            self._busy.release()
-            self.bridge.status_changed.emit("idle")
-            self.bridge.notice.emit("Processing could not start. Try again.")
-
-    def _process(self, audio, *, reserved=False) -> None:
-        if not reserved and not self._busy.acquire(blocking=False):
-            return
-        try:
-            if self._closing.is_set():
+            if self.config.sounds:
+                beep(start=False)
+            if self.recorder.limit_reached or len(audio) < self.config.min_record_seconds * self.config.audio.sample_rate:
+                reason = "pcm_limit" if self.recorder.limit_reached else "short_capture"
+                self.jobs.finish_capture(job, "discarded", reason)
+                self.bridge.status_changed.emit("idle")
+                if self.recorder.limit_reached:
+                    self.bridge.notice.emit("Recording limit exceeded. Try a shorter dictation.")
                 return
-            self.bridge.status_changed.emit("processing")
-            text = self.transcriber.transcribe(audio)
-            if text and not self._closing.is_set():
-                text, outcome = self.postprocessor.process(text)
-                if not self._closing.is_set():
-                    self.bridge.transcribed.emit(text, outcome)
+            self._worker = threading.Thread(target=self._process, args=(audio, job), daemon=True)
+            try:
+                self._worker.start()
+            except RuntimeError:
+                self._worker = None
+                self.jobs.finish_capture(job, "failed", "worker_not_started")
+                self.bridge.status_changed.emit("idle")
+                self.bridge.notice.emit("Processing could not start. Try again.")
+
+    def _process(self, audio, job=None) -> None:
+        if job is None:
+            job = self.jobs.admit(self.postprocessor)
+        if job is None:
+            return
+        try:
+            if not self._closing.is_set():
+                self.bridge.status_changed.emit("processing")
+                self.jobs.run(job, audio, self.transcriber.transcribe)
         except Exception:
             logger.error("processing_failed")
-            self.bridge.notice.emit("Processing failed. Try again.")
+            if not self._closing.is_set():
+                self.bridge.notice.emit("Processing failed. Try again.")
         finally:
-            self.bridge.status_changed.emit("idle")
-            self._busy.release()
+            with self._capture_lock:
+                self.jobs.release(job)
+                self._worker = None
+                if not self._closing.is_set():
+                    self.bridge.status_changed.emit("idle")
 
 
 if __name__ == "__main__":
-    configure_logging()
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-dir", type=Path, help="Use this directory for SQLite, legacy inputs and log")
+    options, qt_args = parser.parse_known_args()
+    configure_logging(options.profile_dir)
+    app = QApplication([sys.argv[0], *qt_args])
     app.setQuitOnLastWindowClosed(False)
 
-    # Prevent multiple instances: stale locks older than 5 s are auto-removed
+    # A live process owns the database for its entire session.
     lock_path = Path(tempfile.gettempdir()) / "whisper_dictation.lock"
     lock_file = QLockFile(str(lock_path))
-    lock_file.setStaleLockTime(5000)
+    lock_file.setStaleLockTime(0)
     if not lock_file.tryLock(100):
         logger.warning("Another instance is already running, exiting")
         QMessageBox.information(
@@ -350,4 +403,6 @@ if __name__ == "__main__":
         )
         sys.exit(0)
 
-    sys.exit(DictationApp(app).run())
+    profile = options.profile_dir
+    database = profile / "artifacts.sqlite3" if profile is not None else None
+    sys.exit(DictationApp(app, database=database, legacy_dir=profile).run())

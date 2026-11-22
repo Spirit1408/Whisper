@@ -21,7 +21,7 @@ M1c — первый стабильный релиз с Raw и Smart. Исход
 | Как согласовывать и фиксировать изменения | [Правила для агентов](AGENTS.md) и [журнал изменений](CHANGELOG.md) |
 | Как восстановить рабочую версию Raw и Smart до изменений M0-B | [Снимок M0-A, версии и процедура проверки](docs/BASELINE.md) |
 
-Проверки текущей версии, измерения до/после и ручной smoke приведены в [результатах M0](docs/M0-RESULTS.md).
+Приёмка M0 и исходные измерения описаны в [результатах M0](docs/M0-RESULTS.md). Для M1a доступны [проверки и запуск в отдельном профиле](docs/TESTING.md).
 
 ## Features
 
@@ -38,7 +38,7 @@ M1c — первый стабильный релиз с Raw и Smart. Исход
 - "Start with Windows" checkbox (managed via the HKCU Run registry key)
 - Closing the window hides the app to tray; it keeps working. Quit via tray menu
 - Tray icon with state indication (blue = idle, red = recording, orange = processing)
-- Checkbox states and history persist between launches (`state.json`, `history.json`)
+- History and preferences persist in SQLite. Open Original on a Smart card to recover the transcription when the edited text differs. Older entries are available in pages of 50.
 - Automatic paste is paused until a recipient can be verified. The clipboard changes only when you choose Copy.
 
 ## Requirements
@@ -67,7 +67,9 @@ Prepare the Whisper snapshot locally. Set `model.name` to a complete local model
 Autostart with Windows is toggled by the "Start with Windows" checkbox in the app
 window (it points the registry Run entry at `run_hidden.vbs`).
 
-Wait for Ready, hold `Ctrl+Win`, speak and release. The window shows the result, the history-write outcome and the Copy action. If hidden, the app also sends a tray notification.
+Wait for Ready, hold `Ctrl+Win`, speak and release. The window shows the result, save status and Copy action. If hidden, it also sends a tray notification. Cancel dictation stops capture or discards an outstanding backend response. Release the hotkey before recording again. The default capture limit is 120 seconds at 16 kHz.
+
+The default database is `%LOCALAPPDATA%/LocalAIInputWorkspace/artifacts.sqlite3`. On first launch the app imports the old `history.json` and known preferences from `state.json`, leaving both files in place. Legacy cards contain the known text, with an unknown Original. On a write error, unsaved text stays available for Copy until Quit. To use an isolated profile, run `.venv\Scripts\python.exe src\main.py --profile-dir <test-directory>`. The database, legacy inputs and log for that session belong to that directory.
 
 ## LM Studio (optional, for post-processing only)
 

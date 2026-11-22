@@ -8,6 +8,8 @@ app-technical.log
 /build/m0-exe/
 state.json
 history.json
+*.sqlite3
+*.sqlite3-*
 
 # Python cache
 __pycache__/

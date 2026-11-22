@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 
 import autostart
 from audio_recorder import list_input_devices
-from history import HistoryStore
+from history import HistoryStore, StorageError
 from settings import SettingsStore
 
 logger = logging.getLogger(__name__)
@@ -101,7 +101,7 @@ QComboBox QAbstractItemView {
 class GuiBridge(QObject):
     """Thread-safe bridge: worker threads emit, GUI thread receives."""
 
-    transcribed = Signal(str, str)
+    transcribed = Signal(object)
     notice = Signal(str)
     status_changed = Signal(str)  # idle | listening | processing
     lm_progress = Signal(str)          # transient status text shown next to the button
@@ -127,7 +127,17 @@ class HistoryCard(QFrame):
         layout.setSpacing(4)
 
         header = QHBoxLayout()
-        time_label = QLabel(datetime.fromtimestamp(entry["ts"]).strftime("%d.%m %H:%M"))
+        stamp = datetime.fromtimestamp(entry["ts"]).strftime("%d.%m %H:%M") if entry["ts"] is not None else "Unknown date"
+        if entry.get("ram"):
+            stamp = "Not saved · RAM only"
+        elif entry["original"] is None:
+            stamp += " · Legacy · Original unknown"
+        else:
+            saved = "Original + Smart" if entry["storage"] == "result" else "Original"
+            stamp += f" · {entry['processing']} · {saved} · {entry['delivery']}"
+            if entry["error"] == "result_write_failed":
+                stamp += " · Smart result not saved"
+        time_label = QLabel(stamp)
         time_label.setObjectName("cardTime")
         header.addWidget(time_label)
         header.addStretch()
@@ -145,11 +155,17 @@ class HistoryCard(QFrame):
         self._delete_btn.setCursor(Qt.PointingHandCursor)
         self._delete_btn.setFixedSize(20, 20)
         self._delete_btn.clicked.connect(lambda: self.deleted.emit(self._entry["id"]))
+        if entry.get("ram"):
+            self._delete_btn.setEnabled(False)
+        if entry.get("original") is not None and entry["original"] != entry["text"]:
+            original_btn = QPushButton("Open Original")
+            original_btn.clicked.connect(lambda: self.clicked.emit(entry["original"]))
+            layout.addWidget(original_btn)
         self._delete_btn.raise_()
         self._position_delete_button()
 
     def enterEvent(self, event) -> None:
-        self._delete_btn.setVisible(True)
+        self._delete_btn.setVisible(self._delete_btn.isEnabled())
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
@@ -177,18 +193,22 @@ class MainWindow(QWidget):
     lm_model_changed = Signal(str)       # user picked a model key in the dropdown
     device_changed = Signal(object)  # device name (str) or None for system default
     notification = Signal(str)
+    cancel_requested = Signal()
 
-    def __init__(self, settings: SettingsStore, history: HistoryStore):
+    def __init__(self, settings: SettingsStore, history: HistoryStore, ram_results):
         super().__init__()
         self.settings = settings
         self.history = history
+        self.ram_results = ram_results
+        self._selected = None
+        self._cursor = None
         self._cards: dict[str, HistoryCard] = {}
 
         self.setWindowTitle("Whisper Dictation")
         self.resize(440, 620)
         self.setStyleSheet(DARK_QSS)
         self._build_ui()
-        self._populate_history()
+        self.refresh_history()
 
     # --- UI construction -------------------------------------------------
 
@@ -257,6 +277,15 @@ class MainWindow(QWidget):
         self.result_label.setWordWrap(True)
         root.addWidget(self.result_label)
 
+        warnings = []
+        for source, report in self.history.reports.items():
+            if report.status not in ("imported", "already_imported", "absent") or report.rejected:
+                warnings.append(f"{source}: {report.status}, skipped {report.rejected}")
+        if warnings:
+            migration_label = QLabel("Storage: " + " · ".join(warnings))
+            migration_label.setWordWrap(True)
+            root.addWidget(migration_label)
+
         # Copy / Clear buttons
         btn_row = QHBoxLayout()
         copy_btn = QPushButton("Copy")
@@ -265,6 +294,9 @@ class MainWindow(QWidget):
         clear_btn.clicked.connect(self.text_edit.clear)
         btn_row.addWidget(copy_btn)
         btn_row.addWidget(clear_btn)
+        cancel_btn = QPushButton("Cancel dictation")
+        cancel_btn.clicked.connect(self.cancel_requested)
+        btn_row.addWidget(cancel_btn)
         btn_row.addStretch()
         root.addLayout(btn_row)
 
@@ -282,6 +314,10 @@ class MainWindow(QWidget):
         self.cards_layout.addStretch()
         scroll.setWidget(container)
         root.addWidget(scroll, stretch=1)
+
+        self.more_btn = QPushButton("Older entries")
+        self.more_btn.clicked.connect(self._load_page)
+        root.addWidget(self.more_btn)
 
         # Status bar
         self.status_bar = QStatusBar()
@@ -313,32 +349,41 @@ class MainWindow(QWidget):
 
     # --- history ----------------------------------------------------------
 
-    def _populate_history(self) -> None:
-        for entry in self.history.entries:
-            self._insert_card(entry, prepend=False)
+    def refresh_history(self):
+        for key in list(self._cards):
+            self._remove_card_widget(key)
+        self._cursor = None
+        for item in reversed(self.ram_results()):
+            self._insert_card(dict(id="ram-" + item.id, text=item.text, original=None, ts=None, ram=True))
+        self._load_page()
 
-    def _insert_card(self, entry: dict, prepend: bool = True) -> None:
+    def _load_page(self):
+        try:
+            entries = self.history.page(self._cursor, limit=51)
+        except StorageError:
+            self.show_notice("History unavailable. Use Copy for text in the editor.")
+            entries = []
+        for entry in entries[:50]:
+            self._insert_card(entry)
+            self._cursor = entry["cursor"]
+        self.more_btn.setVisible(len(entries) > 50)
+
+    def _insert_card(self, entry):
         card = HistoryCard(entry)
-        card.clicked.connect(self._on_card_clicked)
+        card.clicked.connect(lambda text: self._select_text(entry, text))
         card.deleted.connect(self._on_card_deleted)
         self._cards[entry["id"]] = card
-        index = 0 if prepend else self.cards_layout.count() - 1  # keep stretch last
-        self.cards_layout.insertWidget(index, card)
+        self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
 
-    def add_transcription(self, text: str, outcome: str) -> None:
-        """Called (via signal) when a new dictation is transcribed."""
+    def _select_text(self, entry, text):
+        self._selected = (entry["id"], text) if not entry.get("ram") else None
         self.text_edit.setPlainText(text)
-        entry = self.history.add(text)
-        saved = "saved" if entry is not None else "not saved to history"
-        self.show_notice(f"{outcome} · {saved}. Paste skipped. Use Copy.")
-        if entry is None:
-            return
-        self._insert_card(entry, prepend=True)
-        # Trim widgets beyond the store cap
-        valid_ids = {e["id"] for e in self.history.entries}
-        for entry_id in list(self._cards):
-            if entry_id not in valid_ids:
-                self._remove_card_widget(entry_id)
+
+    def add_transcription(self, outcome):
+        self._selected = (outcome.id, outcome.text) if outcome.error is None else None
+        self.text_edit.setPlainText(outcome.text)
+        self.refresh_history()
+        self.show_notice(outcome.message)
 
     def _remove_card_widget(self, entry_id: str) -> None:
         card = self._cards.pop(entry_id, None)
@@ -346,13 +391,11 @@ class MainWindow(QWidget):
             self.cards_layout.removeWidget(card)
             card.deleteLater()
 
-    def _on_card_clicked(self, text: str) -> None:
-        self.text_edit.setPlainText(text)
-
     def _on_card_deleted(self, entry_id: str) -> None:
-        if self.history.remove(entry_id):
+        try:
+            self.history.remove(entry_id)
             self._remove_card_widget(entry_id)
-        else:
+        except StorageError:
             self.show_notice("History change could not be saved.")
 
     # --- checkboxes & buttons ----------------------------------------------
@@ -439,6 +482,11 @@ class MainWindow(QWidget):
         if text:
             try:
                 QGuiApplication.clipboard().setText(text)
+                if self._selected and self._selected[1] == text:
+                    self.history.copied(self._selected[0])
+                self.show_notice("Copied to clipboard.")
+            except StorageError:
+                self.show_notice("Copied to clipboard. Copy status could not be saved.")
             except (RuntimeError, OSError):
                 self.show_notice("Copy failed. The result is available in the editor.")
 

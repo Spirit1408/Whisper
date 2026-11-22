@@ -29,7 +29,7 @@ def choice(content, reason="stop"):
     return {"choices": [{"message": {"content": content}, "finish_reason": reason}]}
 
 
-class SafetyTests(unittest.TestCase):
+class IsolatedApp(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.scratch = TemporaryDirectory(prefix="whisper-m0-c-")
@@ -49,7 +49,13 @@ class SafetyTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        logging.shutdown()
+        for handler in logging.getLogger().handlers[:]:
+            logging.getLogger().removeHandler(handler)
+            handler.close()
+        for name, module in list(sys.modules.items()):
+            filename = getattr(module, "__file__", None)
+            if filename and Path(filename).parent == cls.root / "src":
+                del sys.modules[name]
         sys.path.remove(str(cls.root / "src"))
         cls.env.stop()
         cls.scratch.cleanup()
@@ -69,13 +75,18 @@ class SafetyTests(unittest.TestCase):
         self.block("socket.getaddrinfo", side_effect=AssertionError("unexpected DNS"))
         self.block("autostart.is_enabled", return_value=False)
         self.block("gui.list_input_devices", return_value=[])
+        self.block("audio_recorder.list_input_devices", return_value=[])
         self.block("sounddevice.query_devices", return_value={"name": "test"})
         self.block("main.beep")
         self.send = self.block("keyboard.send")
         self.copy = self.block("pyperclip.copy")
         self.read = self.block("pyperclip.paste", return_value="Synthetic clipboard")
         self.http = self.block("requests.adapters.HTTPAdapter.send", return_value=response(choice(EDIT)))
-        self.app = self.main.DictationApp(self.qt)
+        profile = TemporaryDirectory(dir=self.root)
+        self.addCleanup(profile.cleanup)
+        self.database = Path(profile.name) / "artifacts.sqlite3"
+        self.app = self.main.DictationApp(self.qt, database=self.database, legacy_dir=self.root)
+        self.addCleanup(self.app.history.close)
         self.notify = self.block_app(self.app.tray, "notify")
         self.app.config.sounds = False
         self.audio = np.full(16000, 0.1, dtype=np.float32)
@@ -106,7 +117,7 @@ class SafetyTests(unittest.TestCase):
         self.qt.processEvents()
 
     def assert_result(self, expected, outcome):
-        self.assertEqual([item["text"] for item in self.app.history.entries], [expected])
+        self.assertEqual([item["text"] for item in self.app.history.page()], [expected])
         self.assertEqual(self.app.window.text_edit.toPlainText(), expected)
         self.assertIn(outcome, self.app.window.result_label.text())
         self.assertIn("Copy", self.app.window.result_label.text())
@@ -114,6 +125,7 @@ class SafetyTests(unittest.TestCase):
         self.read.assert_not_called()
         self.copy.assert_not_called()
 
+class SafetyTests(IsolatedApp):
     def test_raw(self):
         self.process(False)
         self.http.assert_not_called()
@@ -164,36 +176,47 @@ class SafetyTests(unittest.TestCase):
         self.assert_result(RAW, "Raw")
 
     def test_unwritable_history(self):
-        self.app.history.path = self.root  # replace() cannot overwrite a directory
+        from history import HistoryStore
+        self.app.history.close()
+        store = HistoryStore(self.root, self.root)  # a directory cannot be opened as SQLite
+        self.addCleanup(store.close)
+        self.app.jobs.store = store
         self.process(False)
         self.assertEqual(self.app.window.text_edit.toPlainText(), RAW)
         self.assertIn("not saved", self.app.window.result_label.text())
-        self.assertFalse(self.app.history.entries)
+        self.assertEqual(self.app.jobs.ram_results()[0].text, RAW)
         self.send.assert_not_called()
 
     def test_disk_full_preserves_previous_json(self):
+        # Legacy files remain byte-identical; a failed result commit keeps both Originals.
+        legacy = self.root / "history.json"
+        legacy.write_bytes(b"[]")
         self.process(False)
-        path = self.app.history.path
-        previous = path.read_bytes()
-        with patch("json.dump", side_effect=OSError("disk full")):
-            self.process()
-        self.assertEqual(path.read_bytes(), previous)
+        store = self.app.history
+        store._execute("""CREATE TRIGGER full_disk BEFORE INSERT ON results
+                          BEGIN SELECT RAISE(ABORT, 'write_failed'); END""", ())
+        self.process()
+        self.assertEqual(legacy.read_bytes(), b"[]")
         self.assertEqual(self.app.window.text_edit.toPlainText(), EDIT)
         self.assertIn("not saved", self.app.window.result_label.text())
-        self.assertEqual([e["text"] for e in self.app.history.entries], [RAW])
+        self.assertEqual([e["text"] for e in store.page()], [RAW, RAW])
+        self.assertEqual(store.page()[0]["storage"], "original")
 
     def test_unreadable_settings_preserved(self):
+        from history import HistoryStore
         from settings import SettingsStore
         path = self.root / "state.json"
         path.write_bytes(b"{")
-        settings = SettingsStore(path)
-        settings.set("lm_model", "synthetic")
+        store = HistoryStore(self.database.with_suffix(".test"), self.root)
+        self.addCleanup(store.close)
+        SettingsStore(store).set("lm_model", "synthetic")
+        self.assertEqual(store.reports["state"].status, "invalid_json")
         self.assertEqual(path.read_bytes(), b"{")
 
     def test_no_result_for_silence(self):
         self.audio.fill(0)
         self.process()
-        self.assertFalse(self.app.history.entries)
+        self.assertFalse(self.app.history.page())
         self.http.assert_not_called()
         self.send.assert_not_called()
 
@@ -202,11 +225,11 @@ class SafetyTests(unittest.TestCase):
         self.app._on_hotkey_press()
         self.app._on_hotkey_release()
         self.assertFalse(self.app.recorder.is_recording)
-        self.assertFalse(self.app._busy.locked())
-        self.app._busy.acquire()
+        self.assertIsNone(self.app.jobs.active)
+        job = self.app.jobs.admit(self.app.postprocessor)
         self.app._on_hotkey_press()
         self.assertFalse(self.app.recorder.is_recording)
-        self.app._busy.release()
+        self.app.jobs.release(job)
         self.http.assert_not_called()
 
     def test_quit_during_recording(self):
@@ -362,7 +385,7 @@ class SafetyTests(unittest.TestCase):
             self.assertFalse(self.app.recorder.is_recording)
             job = thread.call_args.kwargs
             job["target"](*job["args"], **job.get("kwargs", {}))
-        self.assertFalse(self.app._busy.locked())
+        self.assertIsNone(self.app.jobs.active)
         self.assert_result(RAW, "Raw")
 
 
@@ -391,7 +414,7 @@ def microphone_test(stage):
         if stage in ("stop", "close"):
             self.app._on_hotkey_release()
         self.assertFalse(self.app.recorder.is_recording)
-        self.assertFalse(self.app._busy.locked())
+        self.assertIsNone(self.app.jobs.active)
         self.assertNotIn("Listening", self.app.window.status_bar.currentMessage())
         if stage != "open":
             stream.close.assert_called_once()
@@ -401,7 +424,7 @@ def microphone_test(stage):
         self.assertTrue(self.app.recorder.is_recording)
         self.app._on_hotkey_release()
         self.assertFalse(self.app.recorder.is_recording)
-        self.assertFalse(self.app._busy.locked())
+        self.assertIsNone(self.app.jobs.active)
     return run
 
 

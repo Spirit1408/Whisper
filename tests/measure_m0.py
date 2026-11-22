@@ -25,7 +25,7 @@ def measure(args, scratch):
     shutil.copyfile(args.source / "config.yaml", root / "config.yaml")
     sys.path.insert(0, str(root / "src"))
     os.environ.update(QT_QPA_PLATFORM="offscreen", HF_HUB_OFFLINE="1",
-                      HF_HUB_DISABLE_TELEMETRY="1", NO_PROXY="*")
+                      HF_HUB_DISABLE_TELEMETRY="1", NO_PROXY="*", LOCALAPPDATA=str(root))
     sys.addaudithook(restrict_network)
     logging.disable(logging.CRITICAL)
     from PySide6.QtWidgets import QApplication
@@ -55,6 +55,9 @@ def measure(args, scratch):
     else:
         app.postprocessor.base_url = "http://127.0.0.1:1/v1"
         app.postprocessor.model = "offline-probe"
+    def entries():
+        return app.history.page() if hasattr(app.history, "page") else app.history.entries
+
     for wav in args.wav:
         with wave.open(str(wav), "rb") as f:
             assert (f.getnchannels(), f.getframerate(), f.getsampwidth()) == (1, 16000, 2)
@@ -72,7 +75,7 @@ def measure(args, scratch):
                         return value
                     return record
 
-                count = len(app.history.entries)
+                count = len(entries())
                 import requests
                 captured = {}
                 original_send = requests.adapters.HTTPAdapter.send
@@ -96,10 +99,12 @@ def measure(args, scratch):
                     app._process(pcm)
                     qt.processEvents()
                     total = (perf_counter() - start) * 1000
-                assert len(app.history.entries) == count + 1 and app.history.entries[0]["text"].strip()
+                assert len(entries()) == count + 1 and entries()[0]["text"].strip()
                 print(json.dumps(dict(seconds=len(pcm)/16000, smart=smart, total_ms=round(total, 2),
                                       complete_llm=captured.get("complete", False),
                                       dispatch=dispatch.call_count, **stamps)), flush=True)
+    if hasattr(app.history, "close"):
+        app.history.close()
 
 
 if __name__ == "__main__":
