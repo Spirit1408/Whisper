@@ -29,7 +29,7 @@ logger = logging.getLogger("main")
 
 def configure_logging(directory=None) -> None:
     # Libraries may include recognized words, prompts or response URLs even at INFO.
-    allowed = {"main", "transcriber", "audio_recorder", "history", "postprocessor",
+    allowed = {"main", "transcriber", "audio_recorder", "history", "postprocessor", "dictation",
                "lmstudio", "settings", "hotkey", "config", "autostart"}
     handlers = []
     try:
@@ -74,7 +74,7 @@ class DictationApp:
         )
         self.postprocessor = PostProcessor(
             base_url=self.config.postprocess.base_url,
-            model=self.config.postprocess.model,
+            model="",  # Resolve the configured key to a ready local instance before inference.
             timeout_seconds=self.config.postprocess.timeout_seconds,
         )
         self._closing = threading.Event()
@@ -165,6 +165,7 @@ class DictationApp:
 
     def _probe_lm(self) -> None:
         """Reflect the current LM Studio state at startup without starting it."""
+        self.postprocessor.model = ""
 
         def worker() -> None:
             if not self.lm.is_server_up():
@@ -186,6 +187,7 @@ class DictationApp:
 
     def _ensure_lm_ready(self) -> None:
         """Refresh clicked: start the server and load a model if needed."""
+        self.postprocessor.model = ""
 
         def worker() -> None:
             if not self.lm.available:
@@ -237,6 +239,7 @@ class DictationApp:
 
     def _on_lm_model_changed(self, model_key: str) -> None:
         """User picked a different model in the dropdown - load it."""
+        self.postprocessor.model = ""
 
         def worker() -> None:
             loaded = self.lm.loaded_llms()

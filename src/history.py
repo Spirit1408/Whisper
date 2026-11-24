@@ -214,12 +214,12 @@ class HistoryStore:
                 return operation(db, *args)
         return self._call(transaction)
 
-    def start(self, job, processing="transcribing"):
-        self._execute("""INSERT INTO jobs(id,processing) VALUES(?,?)
+    def start(self, job, processing="transcribing", *, auto=False):
+        self._execute("""INSERT INTO jobs(id,processing,delivery) VALUES(?,?,?)
                          ON CONFLICT(id) DO UPDATE SET processing=excluded.processing
-                         WHERE jobs.processing='capturing'""", (job, processing))
+                         WHERE jobs.processing='capturing'""", (job, processing, "skipped" if auto else "not_requested"))
 
-    def original(self, job, text, smart):
+    def original(self, job, text, smart, *, auto=False):
         def save(db):
             row = db.execute("SELECT original_text FROM artifacts WHERE id=?", (job,)).fetchone()
             if row:
@@ -229,11 +229,24 @@ class HistoryStore:
             db.execute("INSERT INTO artifacts(id,created_at,original_text) VALUES(?,?,?)",
                        (job, time.time(), text))
             # May succeed even if the earlier metadata-only transaction failed.
-            db.execute("""INSERT INTO jobs VALUES(?,?,?,'original','skipped',NULL)
+            changed = db.execute("""INSERT INTO jobs VALUES(?,?,?,'original',?,NULL)
                           ON CONFLICT(id) DO UPDATE SET artifact_id=excluded.artifact_id,
-                          processing=excluded.processing, storage='original', delivery='skipped', error=NULL""",
-                       (job, job, "transforming" if smart else "ready"))
+                          processing=excluded.processing, storage='original', delivery=excluded.delivery, error=NULL
+                          WHERE jobs.processing IN ('capturing', 'transcribing') AND jobs.storage='none'""",
+                       (job, job, "transforming" if smart else "ready", "skipped" if auto else "not_requested"))
+            if changed.rowcount != 1:
+                raise StaleAttempt("stale_attempt")
         self._write(save)
+
+    def smart_source(self, job):
+        def read():
+            row = self._connection().execute("""SELECT a.original_text FROM jobs j
+                JOIN artifacts a ON a.id=j.artifact_id WHERE j.id=? AND j.processing='transforming'
+                AND j.storage='original' AND a.trashed=0 AND a.original_text IS NOT NULL""", (job,)).fetchone()
+            if row is None:
+                raise StaleAttempt("stale_attempt")
+            return row[0]
+        return self._call(read)
 
     def result(self, job, text):
         def save(db):
@@ -246,7 +259,14 @@ class HistoryStore:
         self._write(save)
 
     def finish(self, job, processing, error=None):
-        self._execute("UPDATE jobs SET processing=?, error=? WHERE id=?", (processing, error, job))
+        # A delayed error/cancel must never relabel a completed result, even after restart.
+        changed = self._execute("""UPDATE jobs SET processing=?, error=? WHERE id=?
+            AND processing IN ('capturing','transcribing','transforming')
+            AND (?='cancelled' OR artifact_id IS NULL OR EXISTS
+                 (SELECT 1 FROM artifacts WHERE id=jobs.artifact_id AND trashed=0))""",
+                                (processing, error, job, processing))
+        if changed != 1:
+            raise StaleAttempt("stale_attempt")
 
     def copied(self, job):
         # An explicit Copy must not erase evidence of an earlier send or ambiguous outcome.
@@ -256,7 +276,7 @@ class HistoryStore:
     def begin_delivery(self, job, storage):
         def begin(db):
             cursor = db.execute("""UPDATE jobs SET delivery='dispatching'
-                WHERE id=? AND processing='ready' AND storage=? AND delivery='skipped'
+                WHERE id=? AND processing='ready' AND error IS NULL AND storage=? AND delivery='skipped'
                 AND EXISTS (SELECT 1 FROM artifacts WHERE id=jobs.artifact_id AND trashed=0)""",
                                 (job, storage))
             if cursor.rowcount != 1:

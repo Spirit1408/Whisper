@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 import autostart
 from audio_recorder import list_input_devices
 from history import HistoryStore, StorageError
+from postprocessor import SMART_ERRORS
 from settings import SettingsStore
 
 logger = logging.getLogger(__name__)
@@ -125,12 +126,17 @@ class HistoryCard(QFrame):
             stamp += " · Legacy · Original unknown"
         else:
             saved = "Original + Smart" if entry["storage"] == "result" else "Original"
-            delivery = {"skipped": "saved only", "copied": "copied", "confirmed": "delivery confirmed",
+            delivery = {"skipped": "paste skipped", "not_requested": "Artifact Only",
+                        "copied": "copied", "confirmed": "delivery confirmed",
                         "dispatching": "delivery pending", "paste_dispatched": "paste dispatched",
                         "unknown": "delivery unknown"}.get(entry["delivery"], "manual delivery")
             stamp += f" · {entry['processing']} · {saved} · {delivery}"
             if entry["error"] == "result_write_failed":
                 stamp += " · Smart result not saved"
+            elif entry["error"] == "original_read_failed":
+                stamp += " · Original read failed"
+            elif entry["processing"] == "fallback":
+                stamp += " · " + SMART_ERRORS.get(entry["error"], "Smart correction unavailable")
         return stamp
 
     def __init__(self, entry: dict):
@@ -236,6 +242,7 @@ class MainWindow(QWidget):
 
         lm_row = QHBoxLayout()
         self.lm_cb = QCheckBox("LM Studio post-processing")
+        self._lm_ready = False
         self.lm_cb.setEnabled(False)  # enabled after a successful health check
         self.lm_cb.toggled.connect(self._on_lm_toggled)
         lm_row.addWidget(self.lm_cb)
@@ -429,6 +436,7 @@ class MainWindow(QWidget):
 
     def _on_lm_toggled(self, checked: bool) -> None:
         self.settings.set("lm_studio", checked)
+        self.lm_cb.setEnabled(checked or self._lm_ready)
         self.lm_toggle_requested.emit(checked)
 
     def _on_ensure_clicked(self) -> None:
@@ -448,8 +456,7 @@ class MainWindow(QWidget):
         """Lock LM Studio controls while a background operation runs."""
         self.lm_recheck_btn.setEnabled(False)
         self.lm_model_combo.setEnabled(False)
-        self.lm_cb.setEnabled(False)
-        self.lm_toggle_requested.emit(False)
+        self._show_lm_choice(False)
         self.lm_status_label.setText(text)
 
     def set_lm_progress(self, text: str) -> None:
@@ -487,16 +494,19 @@ class MainWindow(QWidget):
             if pos >= 0:
                 self.lm_model_combo.setCurrentIndex(pos)
             self.lm_model_combo.blockSignals(False)
-        self.lm_cb.blockSignals(True)
         if model_loaded:
-            self.lm_cb.setEnabled(True)
-            self.lm_cb.setChecked(bool(self.settings.get("lm_studio", False)))
             self.lm_status_label.setText("ready")
-        else:
-            self.lm_cb.setChecked(False)
-            self.lm_cb.setEnabled(False)
+        self._show_lm_choice(model_loaded)
+
+    def _show_lm_choice(self, ready):
+        # Losing readiness cannot turn an opted-in Smart request into an automatic Raw paste.
+        self._lm_ready = ready
+        requested = bool(self.settings.get("lm_studio", False))
+        self.lm_cb.blockSignals(True)
+        self.lm_cb.setChecked(requested)
+        self.lm_cb.setEnabled(ready or requested)
         self.lm_cb.blockSignals(False)
-        self.lm_toggle_requested.emit(model_loaded and bool(self.settings.get("lm_studio", False)))
+        self.lm_toggle_requested.emit(requested)
 
     def _on_copy(self) -> None:
         text = self.text_edit.toPlainText()

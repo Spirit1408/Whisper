@@ -3,10 +3,14 @@ from __future__ import annotations
 
 from copy import copy
 from dataclasses import dataclass, field, replace
+import logging
 import threading
 from uuid import uuid4
 
 from history import StaleAttempt, StorageError
+from postprocessor import SmartFailure
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -31,6 +35,7 @@ class Outcome:
     delivery: str = "skipped"
     error: str | None = None
     reason: str = ""
+    status_saved: bool = True
 
     @property
     def message(self):
@@ -38,7 +43,7 @@ class Outcome:
                  "result": "Original and Smart result saved"}[self.storage]
         if self.error == "result_write_failed":
             saved += ", Smart result not saved"
-        if self.error == "status_write_failed":
+        if not self.status_saved:
             saved += ", processing status not saved"
         delivery = {"confirmed": "Delivery confirmed by the field",
                     "paste_dispatched": "Paste dispatched. Check the field before using Copy",
@@ -125,9 +130,10 @@ class Coordinator:
 
     def _ready(self, job, outcome):
         if not job.auto:
-            reason = "Artifact only"
-        elif outcome.error or outcome.processing not in ("Raw", "Smart"):
-            reason = "Paste skipped (Smart fallback or save error)"
+            self._publish(job, replace(outcome, delivery="not_requested"))
+            return
+        if outcome.error or (job.processor.enabled and outcome.storage != "result"):
+            reason = "Paste skipped"
         elif job.target is None:
             reason = "Paste skipped (document field could not be verified)"
         else:
@@ -180,7 +186,7 @@ class Coordinator:
     def started_capture(self, job):
         with self.lock:
             try:
-                self.store.start(job.id, "capturing")
+                self.store.start(job.id, "capturing", auto=job.auto)
             except StorageError:
                 pass
 
@@ -194,7 +200,7 @@ class Coordinator:
             if not self._current(job):
                 return
             try:
-                self.store.start(job.id)
+                self.store.start(job.id, auto=job.auto)
             except StorageError:
                 pass  # Still obtain the user's text for manual recovery.
         try:
@@ -215,39 +221,72 @@ class Coordinator:
                 return
             smart = job.processor.enabled
             try:
-                self.store.original(job.id, original, smart)
+                self.store.original(job.id, original, smart, auto=job.auto)
+            except StaleAttempt:
+                job.finished = True
+                return
             except StorageError:
-                self._finish_status(job, "skipped" if smart else "ready", "original_write_failed")
-                self._publish(job, Outcome(job.id, original, "Smart skipped" if smart else "Raw", "none",
-                                           delivery="not_requested", error="original_write_failed"))
+                saved = self._finish_status(job, "skipped" if smart else "ready", "original_write_failed")
+                self._ready(job, Outcome(job.id, original, "Smart skipped" if smart else "Raw", "none",
+                                         error="original_write_failed", status_saved=saved))
                 return
             if not smart:
                 self._ready(job, Outcome(job.id, original, "Raw", "original"))
         if not smart:
             self._deliver(job)
             return
-        # STT and HTTP may return long after cancellation. Only this attempt can commit.
-        try:
-            candidate, label = job.processor.process(original)
-        except Exception:
-            candidate, label = original, "Smart fallback (backend error)"
-        with self.lock:
-            if not self._current(job):
-                return
-            if label != "Smart":
-                saved_status = self._finish_status(job, "fallback", "smart_failed")
-                outcome = Outcome(job.id, original, label, "original",
-                                  error=None if saved_status else "status_write_failed")
-            else:
-                try:
-                    self.store.result(job.id, candidate)
-                    outcome = Outcome(job.id, candidate, label, "result")
-                except StaleAttempt:
-                    job.finished = True
-                    self._finish_status(job, "cancelled")
-                    return
-                except StorageError:
-                    self._finish_status(job, "ready", "result_write_failed")
-                    outcome = Outcome(job.id, candidate, label, "original", error="result_write_failed")
-            self._ready(job, outcome)
+        self._correct(job, original)
         self._deliver(job)
+
+    def _smart_failure(self, job, outcome, processing, code):
+        try:
+            self.store.finish(job.id, processing, code)
+        except StaleAttempt:
+            job.finished = True
+            self._finish_status(job, "cancelled")
+            return
+        except StorageError:
+            outcome = replace(outcome, status_saved=False)
+        self._ready(job, outcome)
+
+    def _correct(self, job, transcript):
+        with self.lock:
+            if not self._current(job) or job.cancel_requested.is_set():
+                return
+            try:
+                original = self.store.smart_source(job.id)
+            except StaleAttempt:
+                job.finished = True
+                self._finish_status(job, "cancelled")
+                return
+            except StorageError:
+                outcome = Outcome(job.id, transcript, "Smart skipped (Original read failed)",
+                                  "original", error="original_read_failed")
+                self._smart_failure(job, outcome, "skipped", outcome.error)
+                return
+        # Neither the SQLite transaction nor the coordinator lock spans inference.
+        failure = None
+        try:
+            candidate = job.processor.process(original)
+        except SmartFailure as exc:
+            failure = exc
+        except Exception:
+            failure = SmartFailure("smart_failed")
+        with self.lock:
+            if not self._current(job) or job.cancel_requested.is_set():
+                return
+            if failure is not None:
+                logger.warning("smart_fallback code=%s", failure.code)
+                outcome = Outcome(job.id, original, f"Smart fallback ({failure})", "original")
+                self._smart_failure(job, outcome, "fallback", failure.code)
+                return
+            try:
+                self.store.result(job.id, candidate)
+            except StaleAttempt:
+                job.finished = True
+                self._finish_status(job, "cancelled")
+            except StorageError:
+                outcome = Outcome(job.id, candidate, "Smart", "original", error="result_write_failed")
+                self._smart_failure(job, outcome, "ready", outcome.error)
+            else:
+                self._ready(job, Outcome(job.id, candidate, "Smart", "result"))

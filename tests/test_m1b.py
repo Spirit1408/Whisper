@@ -140,7 +140,7 @@ class SafeDeliveryTests(IsolatedApp):
             self.app.window._on_copy()
             self.assertEqual(self.app.history.page()[0]["delivery"], "copied")
         self.app.window.delivery_combo.setCurrentIndex(0)
-        self.assertEqual(self.record()["delivery"], "skipped")
+        self.assertEqual(self.record()["delivery"], "not_requested")
         self.app.jobs.delivery.capture.assert_called_once()
 
     def test_cancel_before_dispatch_keeps_saved_text_and_manual_copy(self):

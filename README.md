@@ -74,17 +74,15 @@ Wait for Ready, hold `Ctrl+Win`, speak and release. The window shows the result,
 
 Choose **Auto Paste · verified fields**, place the caret or select a short span in a test document, then hold the hotkey and speak after the recording signal. The two candidate profiles are packaged Windows Notepad with a native `RichEditD2DPT` document and system WordPad with `RICHEDIT50W`. Each dictation checks the active process, window, field, range and clipboard sequence. Single-line text can be inserted or replace the verified selection. A failed check leaves the result available for Copy. Terminals, browsers, chats, password and elevated windows use manual delivery.
 
-**Delivery confirmed** means the exact text was read back from the addressed range. After **Paste dispatched** or **Delivery unknown**, check the original field before pasting manually. Restarting never resends. Choose **Artifact Only** to turn off recipient inspection. Use **Copy** on the current editor text, including edits or an unsaved result. See the [Windows test matrix and remaining manual check](docs/TESTING.md).
+**Delivery confirmed** means the exact text was read back from the addressed range. After **Paste dispatched** or **Delivery unknown**, check the original field before pasting manually. Restarting never resends. Choose **Artifact Only** to turn off recipient inspection. Use **Copy** on the current editor text, including edits or an unsaved result. See the [Windows test matrix and release check](docs/TESTING.md).
 
 The default database is `%LOCALAPPDATA%/LocalAIInputWorkspace/artifacts.sqlite3`. On first launch the app imports the old `history.json` and known preferences from `state.json`, leaving both files in place. Legacy cards contain the known text, with an unknown Original. On a write error, unsaved text stays available for Copy until Quit. To use an isolated profile, run `.venv\Scripts\python.exe src\main.py --profile-dir <test-directory>`. The database, legacy inputs and log for that session belong to that directory.
 
 ## LM Studio (optional, for post-processing only)
 
-The app works fully without LM Studio — it is used only for text cleanup when the
-"LM Studio post-processing" checkbox is enabled. On startup the app does a
-non-intrusive probe; if the server is offline the checkbox stays disabled.
+Raw works independently of LM Studio. Enable **LM Studio post-processing** to request Smart. The app checks the local service at startup. If a previously selected Smart model is unavailable, the checkbox keeps your choice. You can uncheck it to switch explicitly to Raw.
 
-Click **⟳** to check the local service. With the CLI on the default loopback endpoint the app can start the server and load a downloaded model. Use the dropdown when several models are available. Smart becomes available once the chosen instance is reported as loaded. A failed or incomplete response leaves the raw transcription in the editor and shows **Smart fallback**.
+Click **⟳** to check the local service. With the CLI on the default loopback endpoint the app can start the server and load a downloaded model. Use the dropdown when several models are available. Smart reads the saved Original and saves the completed correction before Auto Paste. On a timeout, unavailable model or invalid response, **Smart fallback** shows the reason and leaves the Original in the editor for manual Copy. If saving a valid correction fails, Copy can recover it from a RAM card until Quit.
 
 Switching models issues no unload command. If there is insufficient memory, choose a smaller local model or manage the shared service yourself. Inference accepts a loopback endpoint and disables HTTP redirects and environment proxies.
 

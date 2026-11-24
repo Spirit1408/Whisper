@@ -22,7 +22,7 @@ class ReliableOriginalTests(IsolatedApp):
         def backend(*args, **kwargs):
             self.assertEqual(self.committed_rows("SELECT original_text FROM artifacts"), [(RAW,)])
             self.assertEqual(self.committed_rows("SELECT processing,storage,delivery FROM jobs"),
-                             [("transforming", "original", "skipped")])
+                             [("transforming", "original", "not_requested")])
             return response(choice(EDIT))
         self.http.side_effect = backend
         self.process()
@@ -43,7 +43,7 @@ class ReliableOriginalTests(IsolatedApp):
         self.addCleanup(restarted.close)
         for row in restarted.page():
             self.assertEqual((row["original"], row["text"], row["processing"], row["storage"],
-                              row["delivery"]), (RAW, RAW, "fallback", "original", "skipped"))
+                              row["delivery"]), (RAW, RAW, "fallback", "original", "not_requested"))
         self.assertEqual([row["id"] for row in restarted.page()], ids)
         self.assertEqual(len(ids), 2)
         self.send.assert_not_called()
@@ -301,7 +301,7 @@ os._exit(23)
         worker.join(3)
         self.assertFalse(worker.is_alive())
         self.assertFalse(self.app.recorder.is_recording)
-        self.assertEqual(self.committed_rows("SELECT processing,storage,delivery FROM jobs"), [("cancelled","original","skipped")])
+        self.assertEqual(self.committed_rows("SELECT processing,storage,delivery FROM jobs"), [("cancelled","original","not_requested")])
         self.assertEqual(self.committed_rows("SELECT count(*) FROM results"), [(0,)])
         self.send.assert_not_called()
 
@@ -335,7 +335,7 @@ os._exit(23)
             self.app.qt_app.setProperty("really_quit", False)
         self.assertEqual(self.committed_rows("SELECT original_text FROM artifacts"), [(RAW,)])
         self.assertEqual(self.committed_rows("SELECT processing,storage,delivery FROM jobs"),
-                         [("ready", "original", "skipped")])
+                         [("ready", "original", "not_requested")])
         self.send.assert_not_called()
 
     def test_late_result_after_removal_keeps_artifact_hidden(self):
