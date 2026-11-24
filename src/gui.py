@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QMimeData, QObject, Qt, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -116,6 +116,23 @@ class HistoryCard(QFrame):
     clicked = Signal(str)   # entry text
     deleted = Signal(str)   # entry id
 
+    @staticmethod
+    def status_text(entry):
+        stamp = datetime.fromtimestamp(entry["ts"]).strftime("%d.%m %H:%M") if entry["ts"] is not None else "Unknown date"
+        if entry.get("ram"):
+            stamp = "Not saved · RAM only"
+        elif entry["original"] is None:
+            stamp += " · Legacy · Original unknown"
+        else:
+            saved = "Original + Smart" if entry["storage"] == "result" else "Original"
+            delivery = {"skipped": "saved only", "copied": "copied", "confirmed": "delivery confirmed",
+                        "dispatching": "delivery pending", "paste_dispatched": "paste dispatched",
+                        "unknown": "delivery unknown"}.get(entry["delivery"], "manual delivery")
+            stamp += f" · {entry['processing']} · {saved} · {delivery}"
+            if entry["error"] == "result_write_failed":
+                stamp += " · Smart result not saved"
+        return stamp
+
     def __init__(self, entry: dict):
         super().__init__()
         self.setObjectName("card")
@@ -127,19 +144,9 @@ class HistoryCard(QFrame):
         layout.setSpacing(4)
 
         header = QHBoxLayout()
-        stamp = datetime.fromtimestamp(entry["ts"]).strftime("%d.%m %H:%M") if entry["ts"] is not None else "Unknown date"
-        if entry.get("ram"):
-            stamp = "Not saved · RAM only"
-        elif entry["original"] is None:
-            stamp += " · Legacy · Original unknown"
-        else:
-            saved = "Original + Smart" if entry["storage"] == "result" else "Original"
-            stamp += f" · {entry['processing']} · {saved} · {entry['delivery']}"
-            if entry["error"] == "result_write_failed":
-                stamp += " · Smart result not saved"
-        time_label = QLabel(stamp)
-        time_label.setObjectName("cardTime")
-        header.addWidget(time_label)
+        self.time_label = QLabel(self.status_text(entry))
+        self.time_label.setObjectName("cardTime")
+        header.addWidget(self.time_label)
         header.addStretch()
         layout.addLayout(header)
 
@@ -163,6 +170,10 @@ class HistoryCard(QFrame):
             layout.addWidget(original_btn)
         self._delete_btn.raise_()
         self._position_delete_button()
+
+    def mark_copied(self):
+        self._entry["delivery"] = "copied"
+        self.time_label.setText(self.status_text(self._entry))
 
     def enterEvent(self, event) -> None:
         self._delete_btn.setVisible(self._delete_btn.isEnabled())
@@ -273,7 +284,17 @@ class MainWindow(QWidget):
         self.text_edit.setPlaceholderText("Transcribed text appears here for manual editing\u2026")
         self.text_edit.setMinimumHeight(120)
         root.addWidget(self.text_edit)
-        self.result_label = QLabel("Automatic paste is paused. Use Copy after dictating.")
+        delivery_row = QHBoxLayout()
+        delivery_row.addWidget(QLabel("Delivery"))
+        self.delivery_combo = QComboBox()
+        self.delivery_combo.addItem("Artifact Only", "artifact")
+        self.delivery_combo.addItem("Auto Paste · verified fields", "auto")
+        self.delivery_combo.setCurrentIndex(1 if self.settings.get("delivery_mode") == "auto" else 0)
+        self.delivery_combo.currentIndexChanged.connect(
+            lambda _: self.settings.set("delivery_mode", self.delivery_combo.currentData()))
+        delivery_row.addWidget(self.delivery_combo)
+        root.addLayout(delivery_row)
+        self.result_label = QLabel("Copy is available after dictation.")
         self.result_label.setWordWrap(True)
         root.addWidget(self.result_label)
 
@@ -481,9 +502,17 @@ class MainWindow(QWidget):
         text = self.text_edit.toPlainText()
         if text:
             try:
-                QGuiApplication.clipboard().setText(text)
+                clipboard = QGuiApplication.clipboard()
+                data = QMimeData()
+                data.setText(text)
+                clipboard.setMimeData(data)
+                if not clipboard.ownsClipboard() or clipboard.mimeData() is not data:
+                    self.show_notice("Copy could not be verified. The text is still in the editor.")
+                    return
                 if self._selected and self._selected[1] == text:
-                    self.history.copied(self._selected[0])
+                    selected = self._selected[0]
+                    if self.history.copied(selected) and selected in self._cards:
+                        self._cards[selected].mark_copied()
                 self.show_notice("Copied to clipboard.")
             except StorageError:
                 self.show_notice("Copied to clipboard. Copy status could not be saved.")

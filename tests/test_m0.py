@@ -368,7 +368,7 @@ class SafetyTests(IsolatedApp):
     def test_failed_explicit_copy(self):
         self.process(False)
         clipboard = Mock()
-        clipboard.setText.side_effect = OSError(RAW)
+        clipboard.setMimeData.side_effect = OSError(RAW)
         with patch("gui.QGuiApplication.clipboard", return_value=clipboard):
             self.app.window._on_copy()
         self.assertEqual(self.app.window.text_edit.toPlainText(), RAW)

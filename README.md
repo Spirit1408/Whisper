@@ -1,7 +1,8 @@
 # Local Dictation (Whisper)
 
-System-wide push-to-talk dictation for Windows. Hold a hotkey, speak, release — the text
-appears in the editor. Use **Copy**, then paste into the intended field. Speech recognition runs locally via
+System-wide push-to-talk dictation for Windows. Hold a hotkey, speak and release. The text
+appears in the editor and history. Use **Copy** to paste it yourself, or enable **Auto Paste**
+for compatible Windows document fields. Speech recognition runs locally via
 [faster-whisper](https://github.com/SYSTRAN/faster-whisper) on your GPU, optional text
 cleanup via a local LLM in [LM Studio](https://lmstudio.ai/).
 
@@ -39,7 +40,7 @@ M1c — первый стабильный релиз с Raw и Smart. Исход
 - Closing the window hides the app to tray; it keeps working. Quit via tray menu
 - Tray icon with state indication (blue = idle, red = recording, orange = processing)
 - History and preferences persist in SQLite. Open Original on a Smart card to recover the transcription when the edited text differs. Older entries are available in pages of 50.
-- Automatic paste is paused until a recipient can be verified. The clipboard changes only when you choose Copy.
+- **Artifact Only** is the default. **Auto Paste** addresses the verified document range directly. Only an explicit **Copy** replaces the clipboard.
 
 ## Requirements
 
@@ -69,6 +70,12 @@ window (it points the registry Run entry at `run_hidden.vbs`).
 
 Wait for Ready, hold `Ctrl+Win`, speak and release. The window shows the result, save status and Copy action. If hidden, it also sends a tray notification. Cancel dictation stops capture or discards an outstanding backend response. Release the hotkey before recording again. The default capture limit is 120 seconds at 16 kHz.
 
+### Delivering a dictation
+
+Choose **Auto Paste · verified fields**, place the caret or select a short span in a test document, then hold the hotkey and speak after the recording signal. The two candidate profiles are packaged Windows Notepad with a native `RichEditD2DPT` document and system WordPad with `RICHEDIT50W`. Each dictation checks the active process, window, field, range and clipboard sequence. Single-line text can be inserted or replace the verified selection. A failed check leaves the result available for Copy. Terminals, browsers, chats, password and elevated windows use manual delivery.
+
+**Delivery confirmed** means the exact text was read back from the addressed range. After **Paste dispatched** or **Delivery unknown**, check the original field before pasting manually. Restarting never resends. Choose **Artifact Only** to turn off recipient inspection. Use **Copy** on the current editor text, including edits or an unsaved result. See the [Windows test matrix and remaining manual check](docs/TESTING.md).
+
 The default database is `%LOCALAPPDATA%/LocalAIInputWorkspace/artifacts.sqlite3`. On first launch the app imports the old `history.json` and known preferences from `state.json`, leaving both files in place. Legacy cards contain the known text, with an unknown Original. On a write error, unsaved text stays available for Copy until Quit. To use an isolated profile, run `.venv\Scripts\python.exe src\main.py --profile-dir <test-directory>`. The database, legacy inputs and log for that session belong to that directory.
 
 ## LM Studio (optional, for post-processing only)
@@ -90,6 +97,7 @@ Edit `config.yaml`:
 - `language` — `auto`, `ru` or `en` (fixing the language is slightly faster/more accurate)
 - `postprocess.base_url` — LM Studio server address (cleanup itself is toggled
   by the checkbox in the app window)
+- `delivery.excluded_processes` — additional executable filenames to exclude from Auto Paste, for example `["notepad.exe"]`.
 
 ## Notes
 

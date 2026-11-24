@@ -40,6 +40,7 @@ class AppConfig:
     language: str = "auto"
     min_record_seconds: float = 0.3
     sounds: bool = True
+    excluded_processes: tuple[str, ...] | None = ()
     model: ModelConfig = field(default_factory=ModelConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     postprocess: PostprocessConfig = field(default_factory=PostprocessConfig)
@@ -59,6 +60,19 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     config.language = raw.get("language", config.language)
     config.min_record_seconds = float(raw.get("min_record_seconds", config.min_record_seconds))
     config.sounds = bool(raw.get("sounds", config.sounds))
+    delivery = raw.get("delivery", {})
+    excluded = delivery.get("excluded_processes", []) if isinstance(delivery, dict) else None
+    def executable_name(value):
+        if not isinstance(value, str):
+            return False
+        name = value.strip().lower()
+        return (name.endswith(".exe") and len(name) > 4 and name.isprintable()
+                and not any(char in name for char in '<>:"/\\|?*'))
+
+    if isinstance(excluded, list) and all(executable_name(value) for value in excluded):
+        config.excluded_processes = tuple(x.strip().lower() for x in excluded)
+    else:
+        config.excluded_processes = None  # Invalid policy disables automatic delivery.
 
     model = raw.get("model") or {}
     config.model = ModelConfig(

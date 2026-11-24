@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from audio_recorder import AudioRecorder, resolve_device
 from config import load_config
 from dictation import Coordinator
+from delivery import WindowsDelivery
 from gui import GuiBridge, MainWindow
 from history import HistoryStore
 from hotkey import PushToTalkHotkey
@@ -81,7 +82,7 @@ class DictationApp:
 
         # Thread-safe bridge: worker threads emit, GUI thread reacts
         self.bridge = GuiBridge()
-        self.jobs = Coordinator(self.history, self.bridge.transcribed.emit)
+        self.jobs = Coordinator(self.history, self.bridge.transcribed.emit, WindowsDelivery(self.config.excluded_processes))
         self.window = MainWindow(self.settings, self.history, self.jobs.ram_results)
         self.tray = TrayIcon(on_show=self.window.show_and_raise, on_quit=self._on_quit)
 
@@ -311,7 +312,7 @@ class DictationApp:
         with self._capture_lock:
             if self._closing.is_set() or self.transcriber is None:
                 return
-            job = self.jobs.admit(self.postprocessor)
+            job = self.jobs.admit(self.postprocessor, auto=self.settings.get("delivery_mode") == "auto")
             if job is None:
                 self.bridge.notice.emit("Busy. Release the hotkey and try again after processing.")
                 return

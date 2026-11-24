@@ -59,6 +59,8 @@ SELECT_ENTRY = """SELECT a.rowid AS cursor, a.id, a.created_at AS ts, a.original
 
 
 def valid_preference(key, value):
+    if key == "delivery_mode":
+        return value in ("artifact", "auto")
     if key == "lm_studio":
         return isinstance(value, bool)
     if key in ("lm_model", "audio_device"):
@@ -138,7 +140,7 @@ class HistoryStore:
                     db.execute("PRAGMA user_version=1")
                 db.execute("""UPDATE jobs SET processing='interrupted'
                               WHERE processing IN ('capturing','transcribing','transforming')""")
-                db.execute("UPDATE jobs SET delivery='unknown' WHERE delivery='dispatching'")
+                db.execute("UPDATE jobs SET delivery='unknown' WHERE delivery IN ('dispatching','paste_dispatched')")
         except BaseException:
             db.close()
             raise
@@ -190,7 +192,7 @@ class HistoryStore:
                     accepted += inserted.rowcount
             else:
                 for key, value in packet.items():
-                    if valid_preference(key, value):
+                    if key in ("audio_device", "lm_studio", "lm_model") and valid_preference(key, value):
                         inserted = db.execute("INSERT OR IGNORE INTO preferences VALUES(?,?)",
                                               (key, json.dumps(value)))
                         accepted += inserted.rowcount
@@ -247,12 +249,34 @@ class HistoryStore:
         self._execute("UPDATE jobs SET processing=?, error=? WHERE id=?", (processing, error, job))
 
     def copied(self, job):
-        self._execute("UPDATE jobs SET delivery='copied' WHERE id=?", (job,))
+        # An explicit Copy must not erase evidence of an earlier send or ambiguous outcome.
+        return self._execute("""UPDATE jobs SET delivery='copied' WHERE id=?
+                                AND delivery IN ('skipped','not_requested','copied')""", (job,)) == 1
+
+    def begin_delivery(self, job, storage):
+        def begin(db):
+            cursor = db.execute("""UPDATE jobs SET delivery='dispatching'
+                WHERE id=? AND processing='ready' AND storage=? AND delivery='skipped'
+                AND EXISTS (SELECT 1 FROM artifacts WHERE id=jobs.artifact_id AND trashed=0)""",
+                                (job, storage))
+            if cursor.rowcount != 1:
+                raise StaleAttempt("delivery_unavailable")
+        self._write(begin)
+
+    def end_delivery(self, job, status):
+        if status not in ("confirmed", "skipped", "paste_dispatched", "unknown"):
+            raise ValueError("invalid_delivery")
+        def finish(db):
+            cursor = db.execute("UPDATE jobs SET delivery=? WHERE id=? AND delivery='dispatching'",
+                                (status, job))
+            if cursor.rowcount != 1:
+                raise StaleAttempt("delivery_unavailable")
+        self._write(finish)
 
     def _execute(self, sql, args):
         def execute(db):
-            db.execute(sql, args)
-        self._write(execute)
+            return db.execute(sql, args).rowcount
+        return self._write(execute)
 
     def page(self, before=None, limit=50):
         def read():

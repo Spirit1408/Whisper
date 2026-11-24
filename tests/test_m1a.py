@@ -102,14 +102,18 @@ class ReliableOriginalTests(IsolatedApp):
         widget = self.app.window._cards["ram-" + ram[0].id]
         widget.clicked.emit(EDIT)
         clip = Mock()
+        clip.mimeData.side_effect = lambda: clip.setMimeData.call_args.args[0]
         with patch("gui.QGuiApplication.clipboard", return_value=clip):
             self.app.window._on_copy()
-        clip.setText.assert_called_once_with(EDIT)
+        clip.setMimeData.assert_called_once()
+        self.assertEqual(clip.mimeData().text(), EDIT)
         self.assertIn("Copied", self.app.window.result_label.text())
 
     def test_explicit_copy_changes_only_delivery(self):
         self.process()
-        with patch("gui.QGuiApplication.clipboard"):
+        with patch("gui.QGuiApplication.clipboard") as clipboard:
+            clip = clipboard.return_value
+            clip.mimeData.side_effect = lambda: clip.setMimeData.call_args.args[0]
             self.app.window._on_copy()
         row = self.app.history.page()[0]
         self.assertEqual((row["original"], row["text"], row["processing"], row["storage"], row["delivery"]),

@@ -29,3 +29,7 @@ postprocess:
 
 # Beep on recording start/stop
 sounds: true
+
+# Optional additional exclusions for verified Auto Paste, by executable filename.
+delivery:
+  excluded_processes: []
