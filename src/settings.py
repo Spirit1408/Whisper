@@ -22,3 +22,5 @@ class SettingsStore:
             self.store.set_preference(key, value)
         except StorageError:
             logger.warning("preference_not_saved")
+            return False
+        return True

@@ -69,7 +69,7 @@ class SmartDictationTests(IsolatedApp):
                          (RAW, EDIT, "ready", "result", "confirmed"))
 
     def test_malformed_or_unfinished_response_never_reaches_recipient(self):
-        packets = [choice(text) for text in ("\x00text", "\ud800", " \u200b ")]
+        packets = [choice(text) for text in ("\x00text", "\ud800", " \u200b ", "<think>reasoning</think>text")]
         packets += [choice(EDIT, "tool_calls"), choice(EDIT, "content_filter"), choice(EDIT, "length"),
                     dict(choice(EDIT), error={"code": 1}), {"choices": choice(EDIT)["choices"] * 2}]
         for field, value in (("role", "user"), ("tool_calls", [{}]), ("function_call", {"name": "test"}),
@@ -146,7 +146,7 @@ class SmartDictationTests(IsolatedApp):
     def test_result_commit_rolls_back_and_keeps_prior_success_and_ram_candidate(self):
         from history import StaleAttempt
         previous = self.dictate()
-        self.store._execute("CREATE TABLE guard (id TEXT REFERENCES results(artifact_id) DEFERRABLE INITIALLY DEFERRED)", ())
+        self.store._execute("CREATE TABLE guard (id TEXT REFERENCES artifacts(id) DEFERRABLE INITIALLY DEFERRED)", ())
         self.store._execute("""CREATE TRIGGER reject_commit AFTER INSERT ON results
                                BEGIN INSERT INTO guard VALUES ('missing'); END""", ())
         row = self.dictate()

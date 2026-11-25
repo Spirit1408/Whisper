@@ -17,7 +17,7 @@ from config import load_config
 from dictation import Coordinator
 from delivery import WindowsDelivery
 from gui import GuiBridge, MainWindow
-from history import HistoryStore
+from history import HistoryStore, StorageError
 from hotkey import PushToTalkHotkey
 from lmstudio import LMStudioManager
 from postprocessor import PostProcessor
@@ -79,10 +79,12 @@ class DictationApp:
         )
         self._closing = threading.Event()
         self.lm = LMStudioManager(base_url=self.config.postprocess.base_url, closing=self._closing)
+        self._loaded_models = {}
 
         # Thread-safe bridge: worker threads emit, GUI thread reacts
         self.bridge = GuiBridge()
-        self.jobs = Coordinator(self.history, self.bridge.transcribed.emit, WindowsDelivery(self.config.excluded_processes))
+        self.jobs = Coordinator(self.history, self.bridge.transcribed.emit,
+                                WindowsDelivery(self.config.excluded_processes), self.bridge.notice.emit)
         self.window = MainWindow(self.settings, self.history, self.jobs.ram_results)
         self.tray = TrayIcon(on_show=self.window.show_and_raise, on_quit=self._on_quit)
 
@@ -100,6 +102,11 @@ class DictationApp:
         self.window.lm_model_changed.connect(self._on_lm_model_changed)
         self.window.device_changed.connect(self._on_device_changed)
         self.window.cancel_requested.connect(self._on_cancel)
+        self.window.repeat_requested.connect(self._on_repeat)
+        self.window.draft_started.connect(self._on_draft)
+        self.window.manual_delivery_requested.connect(self.jobs.disable_auto)
+        self.bridge.presets_used.connect(self.window.presets.refresh)
+        self.postprocessor.enabled = self.window.selection.active != "raw"
 
         # Heavy import deferred so the UI shows up while the model loads
         self.transcriber = None
@@ -166,6 +173,7 @@ class DictationApp:
     def _probe_lm(self) -> None:
         """Reflect the current LM Studio state at startup without starting it."""
         self.postprocessor.model = ""
+        self._loaded_models = {}
 
         def worker() -> None:
             if not self.lm.is_server_up():
@@ -174,7 +182,7 @@ class DictationApp:
                 self.bridge.lm_ready.emit(False, None)
                 return
             available = self.lm.list_llms()
-            loaded = self.lm.loaded_llms()
+            loaded = self._read_loaded()
             loaded_key = self._choose_loaded(loaded)
             self.bridge.lm_models.emit(available or [(k, k) for k in loaded], loaded_key)
             if loaded_key:
@@ -188,11 +196,12 @@ class DictationApp:
     def _ensure_lm_ready(self) -> None:
         """Refresh clicked: start the server and load a model if needed."""
         self.postprocessor.model = ""
+        self._loaded_models = {}
 
         def worker() -> None:
             if not self.lm.available:
                 up = self.lm.is_server_up()
-                loaded = self.lm.loaded_llms() if up else {}
+                loaded = self._read_loaded() if up else {}
                 key = self._choose_loaded(loaded)
                 self.postprocessor.model = loaded[key] if key else ""
                 self.bridge.lm_progress.emit("no selected model ready" if up else "local server offline")
@@ -210,7 +219,7 @@ class DictationApp:
                     return
 
             available = self.lm.list_llms()
-            loaded = self.lm.loaded_llms()
+            loaded = self._read_loaded()
             loaded_key = self._choose_loaded(loaded)
             self.bridge.lm_models.emit(available, loaded_key)
 
@@ -223,7 +232,7 @@ class DictationApp:
                     self.bridge.lm_ready.emit(False, None)
                     return
                 self.bridge.lm_progress.emit("loading local model...")
-                loaded = self.lm.loaded_llms() if self.lm.load_model(target) else {}
+                loaded = self._read_loaded() if self.lm.load_model(target) else {}
                 if target not in loaded:
                     self.bridge.lm_progress.emit("model load failed")
                     self.bridge.lm_ready.emit(False, None)
@@ -240,12 +249,13 @@ class DictationApp:
     def _on_lm_model_changed(self, model_key: str) -> None:
         """User picked a different model in the dropdown - load it."""
         self.postprocessor.model = ""
+        self._loaded_models = {}
 
         def worker() -> None:
-            loaded = self.lm.loaded_llms()
+            loaded = self._read_loaded()
             if model_key not in loaded:
                 self.bridge.lm_progress.emit("loading local model...")
-                loaded = self.lm.loaded_llms() if self.lm.load_model(model_key) else {}
+                loaded = self._read_loaded() if self.lm.load_model(model_key) else {}
                 if model_key not in loaded:
                     self.bridge.lm_progress.emit("model load failed")
                     self.postprocessor.model = ""
@@ -256,6 +266,10 @@ class DictationApp:
             self.bridge.lm_ready.emit(True, model_key)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _read_loaded(self):
+        self._loaded_models = self.lm.loaded_llms()
+        return self._loaded_models
 
     def _stop_capture(self):
         job, self._capture_job = self._capture_job, None
@@ -311,13 +325,51 @@ class DictationApp:
 
     # --- dictation flow ------------------------------------------------
 
+    def _admit(self, *, auto=False, repeat=None):
+        state = self.window.selection
+        with state.lock:
+            active = state.active
+            if self.settings.get("active_preset") is None:
+                active = "strict" if self.postprocessor.enabled else "raw"
+            preset = state.definitions.get(state.once or active)
+            if preset is None:
+                self.bridge.notice.emit("Preset unavailable. Select an available preset.")
+                return None
+            processor = self.postprocessor.bind(preset, self._loaded_models)
+            job = self.jobs.admit(processor, auto=auto and self.settings.get("delivery_mode") == "auto")
+            if job is None:
+                self.bridge.notice.emit("Busy. Try again after processing.")
+                return None
+            if repeat:
+                try:
+                    self.jobs.prepare_repeat(job, *repeat)
+                except StorageError:
+                    self.jobs.release(job)
+                    self.bridge.notice.emit("Source unavailable or changed. Reopen the saved version.")
+                    return None
+            if state.once:
+                state.once = None
+                self.bridge.presets_used.emit()
+            return job
+
+    def _on_draft(self, artifact):
+        with self._capture_lock:
+            job = self.jobs.active
+            if job and (job.repeat_artifact or job.id) == artifact:
+                self.jobs.cancel()
+
+    def _on_repeat(self, artifact, source, revision):
+        with self._capture_lock:
+            job = self._admit(repeat=(artifact, source, revision))
+            if job:
+                self._start_worker(None, job)
+
     def _on_hotkey_press(self) -> None:
         with self._capture_lock:
             if self._closing.is_set() or self.transcriber is None:
                 return
-            job = self.jobs.admit(self.postprocessor, auto=self.settings.get("delivery_mode") == "auto")
+            job = self._admit(auto=True)
             if job is None:
-                self.bridge.notice.emit("Busy. Release the hotkey and try again after processing.")
                 return
             try:
                 self.recorder.start()
@@ -356,24 +408,30 @@ class DictationApp:
                 if self.recorder.limit_reached:
                     self.bridge.notice.emit("Recording limit exceeded. Try a shorter dictation.")
                 return
-            self._worker = threading.Thread(target=self._process, args=(audio, job), daemon=True)
-            try:
-                self._worker.start()
-            except RuntimeError:
-                self._worker = None
-                self.jobs.finish_capture(job, "failed", "worker_not_started")
-                self.bridge.status_changed.emit("idle")
-                self.bridge.notice.emit("Processing could not start. Try again.")
+            self._start_worker(audio, job)
+
+    def _start_worker(self, audio, job):
+        self._worker = threading.Thread(target=self._process, args=(audio, job), daemon=True)
+        try:
+            self._worker.start()
+        except RuntimeError:
+            self._worker = None
+            self.jobs.finish_capture(job, "failed", "worker_not_started")
+            self.bridge.status_changed.emit("idle")
+            self.bridge.notice.emit("Processing could not start. Try again.")
 
     def _process(self, audio, job=None) -> None:
         if job is None:
-            job = self.jobs.admit(self.postprocessor)
+            job = self._admit()
         if job is None:
             return
         try:
             if not self._closing.is_set():
                 self.bridge.status_changed.emit("processing")
-                self.jobs.run(job, audio, self.transcriber.transcribe)
+                if job.repeat_artifact:
+                    self.jobs.run_repeat(job)
+                else:
+                    self.jobs.run(job, audio, self.transcriber.transcribe)
         except Exception:
             logger.error("processing_failed")
             if not self._closing.is_set():

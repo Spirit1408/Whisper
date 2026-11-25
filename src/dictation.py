@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import copy
 from dataclasses import dataclass, field, replace
 import logging
+import re
 import threading
 from uuid import uuid4
 
@@ -23,6 +24,9 @@ class Request:
     target: object | None = None
     pending: Outcome | None = None
     dispatch_started: bool = False
+    repeat_artifact: str | None = None
+    saved_level: str = "original"
+    delivery_revoked: threading.Event = field(default_factory=threading.Event)
     cancel_requested: threading.Event = field(default_factory=threading.Event)
 
 
@@ -36,13 +40,15 @@ class Outcome:
     error: str | None = None
     reason: str = ""
     status_saved: bool = True
+    artifact: str | None = None
+    keep_editor: bool = False
 
     @property
     def message(self):
-        saved = {"none": "not saved to history", "original": "Original saved",
-                 "result": "Original and Smart result saved"}[self.storage]
+        saved = {"none": "not saved to history", "original": "Original saved", "legacy": "legacy text saved",
+                 "result": "result saved"}[self.storage]
         if self.error == "result_write_failed":
-            saved += ", Smart result not saved"
+            saved += ", new result not saved"
         if not self.status_saved:
             saved += ", processing status not saved"
         delivery = {"confirmed": "Delivery confirmed by the field",
@@ -54,10 +60,11 @@ class Outcome:
 
 
 class Coordinator:
-    def __init__(self, store, publish, delivery=None):
+    def __init__(self, store, publish, delivery=None, notice=None):
         self.store = store
         self.publish = publish
         self.delivery = delivery
+        self.notice = notice
         self.lock = threading.RLock()
         self.active = None
         self.closed = False
@@ -120,7 +127,14 @@ class Coordinator:
         with self.lock:
             return tuple(self.unsaved.values())
 
+    def disable_auto(self):
+        job = self.active
+        if job is not None:
+            job.delivery_revoked.set()
+
     def _publish(self, job, outcome):
+        if job.repeat_artifact:
+            outcome = replace(outcome, artifact=job.repeat_artifact)
         job.finished = True
         job.pending = None
         if outcome.error in ("original_write_failed", "result_write_failed"):
@@ -128,11 +142,13 @@ class Coordinator:
         if not self.closed:
             self.publish(outcome)
 
-    def _ready(self, job, outcome):
+    def _ready(self, job, outcome, manual_reason=""):
         if not job.auto:
             self._publish(job, replace(outcome, delivery="not_requested"))
             return
-        if outcome.error or (job.processor.enabled and outcome.storage != "result"):
+        if manual_reason:
+            reason = manual_reason
+        elif job.delivery_revoked.is_set() or outcome.error or (job.processor.enabled and outcome.storage != "result"):
             reason = "Paste skipped"
         elif job.target is None:
             reason = "Paste skipped (document field could not be verified)"
@@ -162,7 +178,7 @@ class Coordinator:
             except StorageError:
                 self._publish(job, replace(outcome, reason="Paste skipped (delivery unavailable)"))
                 return
-            if job.cancel_requested.is_set():
+            if job.cancel_requested.is_set() or job.delivery_revoked.is_set():
                 try:
                     self.store.end_delivery(job.id, "skipped")
                 except StorageError:
@@ -221,13 +237,16 @@ class Coordinator:
                 return
             smart = job.processor.enabled
             try:
-                self.store.original(job.id, original, smart, auto=job.auto)
+                self.store.original(job.id, original, smart, auto=job.auto,
+                                    preset=getattr(job.processor, "preset", None),
+                                    model=getattr(job.processor, "model", ""))
             except StaleAttempt:
                 job.finished = True
                 return
             except StorageError:
                 saved = self._finish_status(job, "skipped" if smart else "ready", "original_write_failed")
-                self._ready(job, Outcome(job.id, original, "Smart skipped" if smart else "Raw", "none",
+                label = job.processor.preset.name + " skipped" if smart else "Raw"
+                self._ready(job, Outcome(job.id, original, label, "none",
                                          error="original_write_failed", status_saved=saved))
                 return
             if not smart:
@@ -235,39 +254,55 @@ class Coordinator:
         if not smart:
             self._deliver(job)
             return
-        self._correct(job, original)
+        self._transform(job, original)
         self._deliver(job)
+
+    def prepare_repeat(self, job, artifact, source, revision):
+        with self.lock:
+            if not self._current(job) or job.auto:
+                raise StaleAttempt("repeat_unavailable")
+            job.saved_level = self.store.start_repeat(job.id, artifact, source, revision,
+                                                     job.processor.preset, job.processor.model)
+            job.repeat_artifact = artifact
+
+    def run_repeat(self, job):
+        self._transform(job, "")
+
+    def _stale(self, job):
+        job.finished = True
+        self._finish_status(job, "cancelled")
+        if job.repeat_artifact and self.notice and not self.closed:
+            self.notice("Reprocessing stopped. The saved version changed or the entry was removed.")
 
     def _smart_failure(self, job, outcome, processing, code):
         try:
             self.store.finish(job.id, processing, code)
         except StaleAttempt:
-            job.finished = True
-            self._finish_status(job, "cancelled")
+            self._stale(job)
             return
         except StorageError:
             outcome = replace(outcome, status_saved=False)
         self._ready(job, outcome)
 
-    def _correct(self, job, transcript):
+    def _transform(self, job, transcript):
+        preset = job.processor.preset
         with self.lock:
             if not self._current(job) or job.cancel_requested.is_set():
                 return
             try:
                 original = self.store.smart_source(job.id)
             except StaleAttempt:
-                job.finished = True
-                self._finish_status(job, "cancelled")
+                self._stale(job)
                 return
             except StorageError:
-                outcome = Outcome(job.id, transcript, "Smart skipped (Original read failed)",
-                                  "original", error="original_read_failed")
+                outcome = Outcome(job.id, transcript, f"{preset.name} skipped (source read failed)",
+                                  job.saved_level, error="original_read_failed", keep_editor=bool(job.repeat_artifact))
                 self._smart_failure(job, outcome, "skipped", outcome.error)
                 return
         # Neither the SQLite transaction nor the coordinator lock spans inference.
         failure = None
         try:
-            candidate = job.processor.process(original)
+            candidate = job.processor.process(original) if job.processor.enabled else original
         except SmartFailure as exc:
             failure = exc
         except Exception:
@@ -277,16 +312,23 @@ class Coordinator:
                 return
             if failure is not None:
                 logger.warning("smart_fallback code=%s", failure.code)
-                outcome = Outcome(job.id, original, f"Smart fallback ({failure})", "original")
-                self._smart_failure(job, outcome, "fallback", failure.code)
+                label = "Smart fallback" if preset.correction else f"{preset.name} failed"
+                status = "fallback" if preset.correction else "failed"
+                outcome = Outcome(job.id, original, f"{label} ({failure})", job.saved_level,
+                                  keep_editor=bool(job.repeat_artifact))
+                self._smart_failure(job, outcome, status, failure.code)
                 return
             try:
                 self.store.result(job.id, candidate)
             except StaleAttempt:
-                job.finished = True
-                self._finish_status(job, "cancelled")
+                self._stale(job)
             except StorageError:
-                outcome = Outcome(job.id, candidate, "Smart", "original", error="result_write_failed")
+                outcome = Outcome(job.id, candidate, preset.name, job.saved_level, error="result_write_failed")
                 self._smart_failure(job, outcome, "ready", outcome.error)
             else:
-                self._ready(job, Outcome(job.id, candidate, "Smart", "result"))
+                reason = ""
+                if job.auto and not preset.correction and preset.id != "raw":
+                    source_words = re.findall(r"\w+", original.casefold())
+                    if source_words == re.findall(r"\w+", candidate.casefold()):
+                        reason = "Paste skipped (output repeats source wording)"
+                self._ready(job, Outcome(job.id, candidate, preset.name, "result"), reason)

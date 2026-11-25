@@ -86,6 +86,16 @@ Click **⟳** to check the local service. With the CLI on the default loopback e
 
 Switching models issues no unload command. If there is insufficient memory, choose a smaller local model or manage the shared service yourself. Inference accepts a loopback endpoint and disables HTTP redirects and environment proxies.
 
+### Presets and saved results
+
+Choose **Active preset** for future sessions or **Next operation** for a single dictation or **Run preset**. Raw keeps the source. Smart Strict corrects punctuation and checks the words, numbers and question boundaries. Natural smooths spoken phrasing and Professional changes the register. Prompt Engineer rewrites a request, Translator translates, Formatter structures text, Task Extractor lists tasks, and Summarizer condenses the source.
+
+Select Translator and open **Configure** to choose the target language (initially English). Each model-based preset can inherit the global model and timeout or use a loaded LM Studio model key and a timeout of 1–300 seconds. Refresh the model list after changing loaded instances. **New** opens the custom instruction editor. **Export JSON** writes the active custom definition to a new local file. **Import JSON** creates a separate custom preset.
+
+Open a history card and select Original or a saved preset result next to **Run preset**. Reprocessing always saves to the card. **Save edit** updates the selected result. Editing Original creates a Raw result and leaves Original available. Choose **Discard edit** to reload a saved version. A failed or cancelled repeat preserves earlier results. A failed specialized dictation leaves the source available for manual recovery and skips Auto Paste.
+
+On the first upgrade from SQLite v1, the app saves a verified v1 backup beside the database (`artifacts.sqlite3.v1-*`) before migrating to v2. For rollback, open a separate M1c profile with a copy of that backup named `artifacts.sqlite3`. Keep the v2 profile for entries and edits made after the upgrade.
+
 ## Configuration
 
 Edit `config.yaml`:
@@ -93,8 +103,8 @@ Edit `config.yaml`:
 - `hotkey` — push-to-talk combo, e.g. `ctrl+windows`, `ctrl+alt`, `f9`
 - `model.name` — `large-v3-turbo` (fast) or `large-v3` (max accuracy)
 - `language` — `auto`, `ru` or `en` (fixing the language is slightly faster/more accurate)
-- `postprocess.base_url` — LM Studio server address (cleanup itself is toggled
-  by the checkbox in the app window)
+- `postprocess.base_url` — loopback LM Studio endpoint for model-based presets
+- `postprocess.timeout_seconds` — global response timeout, inherited by presets unless overridden
 - `delivery.excluded_processes` — additional executable filenames to exclude from Auto Paste, for example `["notepad.exe"]`.
 
 ## Notes

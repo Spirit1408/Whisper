@@ -24,7 +24,8 @@ from PySide6.QtWidgets import (
 
 import autostart
 from audio_recorder import list_input_devices
-from history import HistoryStore, StorageError
+from history import HistoryStore, StaleAttempt, StorageError
+from preset_ui import PresetControls, PresetSelection
 from postprocessor import SMART_ERRORS
 from settings import SettingsStore
 
@@ -109,6 +110,7 @@ class GuiBridge(QObject):
     lm_models = Signal(list, object)   # (available [(key, name)], loaded_key | None)
     lm_ready = Signal(bool, object)    # (model_loaded, loaded_key | None)
     lm_selected = Signal(str)
+    presets_used = Signal()
 
 
 class HistoryCard(QFrame):
@@ -122,21 +124,29 @@ class HistoryCard(QFrame):
         stamp = datetime.fromtimestamp(entry["ts"]).strftime("%d.%m %H:%M") if entry["ts"] is not None else "Unknown date"
         if entry.get("ram"):
             stamp = "Not saved · RAM only"
-        elif entry["original"] is None:
-            stamp += " · Legacy · Original unknown"
         else:
-            saved = "Original + Smart" if entry["storage"] == "result" else "Original"
+            if entry["original"] is None:
+                stamp += " · Legacy · Original unknown"
+                if not entry.get("job_id"):
+                    return stamp
+            saved = entry.get("preset_name") or entry.get("preset_id") or "Original"
+            if entry.get("manual"):
+                saved += " (edited)"
             delivery = {"skipped": "paste skipped", "not_requested": "Artifact Only",
                         "copied": "copied", "confirmed": "delivery confirmed",
                         "dispatching": "delivery pending", "paste_dispatched": "paste dispatched",
                         "unknown": "delivery unknown"}.get(entry["delivery"], "manual delivery")
             stamp += f" · {entry['processing']} · {saved} · {delivery}"
+            first = entry.get("dictation_delivery")
+            if entry.get("job_id") != entry["id"] and first in ("confirmed", "paste_dispatched", "unknown"):
+                stamp += f" · initial paste: {first}"
             if entry["error"] == "result_write_failed":
-                stamp += " · Smart result not saved"
+                stamp += " · new result not saved"
             elif entry["error"] == "original_read_failed":
                 stamp += " · Original read failed"
-            elif entry["processing"] == "fallback":
-                stamp += " · " + SMART_ERRORS.get(entry["error"], "Smart correction unavailable")
+            elif entry["processing"] in ("failed", "fallback"):
+                stamp += " · " + (entry.get("attempted_preset") or "Smart")
+                stamp += " · " + SMART_ERRORS.get(entry["error"], "processing unavailable")
         return stamp
 
     def __init__(self, entry: dict):
@@ -151,6 +161,7 @@ class HistoryCard(QFrame):
 
         header = QHBoxLayout()
         self.time_label = QLabel(self.status_text(entry))
+        self.time_label.setTextFormat(Qt.PlainText)
         self.time_label.setObjectName("cardTime")
         header.addWidget(self.time_label)
         header.addStretch()
@@ -211,20 +222,24 @@ class MainWindow(QWidget):
     device_changed = Signal(object)  # device name (str) or None for system default
     notification = Signal(str)
     cancel_requested = Signal()
+    repeat_requested = Signal(str, str, int)
+    draft_started = Signal(str)
+    manual_delivery_requested = Signal()
 
     def __init__(self, settings: SettingsStore, history: HistoryStore, ram_results):
         super().__init__()
         self.settings = settings
         self.history = history
         self.ram_results = ram_results
-        self._selected = None
+        self.selection = PresetSelection(history, settings)
         self._cursor = None
         self._cards: dict[str, HistoryCard] = {}
 
         self.setWindowTitle("Whisper Dictation")
-        self.resize(440, 620)
+        self.resize(560, 800)
         self.setStyleSheet(DARK_QSS)
         self._build_ui()
+        self._plain_view("")
         self.refresh_history()
 
     # --- UI construction -------------------------------------------------
@@ -268,6 +283,10 @@ class MainWindow(QWidget):
         self.lm_model_combo.addItem("No model loaded", None)
         self.lm_model_combo.currentIndexChanged.connect(self._on_lm_model_selected)
         root.addWidget(self.lm_model_combo)
+        self.presets = PresetControls(self.history, self.settings, self.selection)
+        self.presets.changed.connect(lambda: self._show_lm_choice(self._lm_ready))
+        self.presets.notice.connect(self.show_notice)
+        root.addWidget(self.presets)
 
         # Microphone selector
         mic_row = QHBoxLayout()
@@ -291,17 +310,29 @@ class MainWindow(QWidget):
         self.text_edit.setPlaceholderText("Transcribed text appears here for manual editing\u2026")
         self.text_edit.setMinimumHeight(120)
         root.addWidget(self.text_edit)
+        self.text_edit.textChanged.connect(self._text_changed)
+        versions_row = QHBoxLayout()
+        self.version_combo = QComboBox()
+        self.version_combo.setPlaceholderText("Select a history entry")
+        self.version_combo.currentIndexChanged.connect(self._change_version)
+        versions_row.addWidget(self.version_combo, 1)
+        for title, action in (("Save edit", self._save_edit), ("Discard edit", self._discard_edit),
+                              ("Run preset", self._repeat)):
+            button = QPushButton(title)
+            button.clicked.connect(action)
+            versions_row.addWidget(button)
+        root.addLayout(versions_row)
         delivery_row = QHBoxLayout()
         delivery_row.addWidget(QLabel("Delivery"))
         self.delivery_combo = QComboBox()
         self.delivery_combo.addItem("Artifact Only", "artifact")
         self.delivery_combo.addItem("Auto Paste · verified fields", "auto")
         self.delivery_combo.setCurrentIndex(1 if self.settings.get("delivery_mode") == "auto" else 0)
-        self.delivery_combo.currentIndexChanged.connect(
-            lambda _: self.settings.set("delivery_mode", self.delivery_combo.currentData()))
+        self.delivery_combo.currentIndexChanged.connect(self._set_delivery)
         delivery_row.addWidget(self.delivery_combo)
         root.addLayout(delivery_row)
         self.result_label = QLabel("Copy is available after dictation.")
+        self.result_label.setTextFormat(Qt.PlainText)
         self.result_label.setWordWrap(True)
         root.addWidget(self.result_label)
 
@@ -397,6 +428,9 @@ class MainWindow(QWidget):
         self.more_btn.setVisible(len(entries) > 50)
 
     def _insert_card(self, entry):
+        preset = self.selection.definitions.get(entry.get("preset_id"))
+        if preset:
+            entry["preset_name"] = preset.name
         card = HistoryCard(entry)
         card.clicked.connect(lambda text: self._select_text(entry, text))
         card.deleted.connect(self._on_card_deleted)
@@ -404,13 +438,128 @@ class MainWindow(QWidget):
         self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
 
     def _select_text(self, entry, text):
-        self._selected = (entry["id"], text) if not entry.get("ram") else None
+        if self._dirty:
+            self.show_notice("Save or discard the editor changes first.")
+            return
+        if entry.get("ram"):
+            self._plain_view(text)
+            return
+        source = "original" if text == entry["original"] and text != entry["text"] else entry.get("preset_id")
+        try:
+            self._open_entry(entry["id"], source)
+        except StorageError:
+            self.show_notice("Entry unavailable.")
+
+    def _plain_view(self, text):
+        self._artifact = self._selected = None
+        self._versions = {}
+        self._view_key = self._original_job = None
+        self._root_text = ""
+        self.version_combo.clear()
+        self.version_combo.setEnabled(False)
+        self._display(text)
+
+    def _display(self, text):
+        self._base_text = text
+        self._dirty = False
+        self.text_edit.blockSignals(True)
         self.text_edit.setPlainText(text)
+        self.text_edit.blockSignals(False)
+
+    def _open_entry(self, artifact, source=None):
+        entry = self.history.entry(artifact)
+        versions = self.history.versions(artifact)
+        root = "original" if entry["original"] is not None else "legacy"
+        self._artifact = artifact
+        self._versions = versions
+        self._original_job = artifact if entry["job_id"] == artifact and entry["storage"] == "original" else None
+        self._root_text = entry["original"] if root == "original" else entry["legacy_text"]
+        combo = self.version_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Original" if root == "original" else "Legacy text · Original unknown", root)
+        for key, row in versions.items():
+            preset = self.selection.definitions.get(key)
+            name = preset.name if preset else key
+            combo.addItem(f"{name} · r{row['revision']}" + (" · edited" if row["manual"] else ""), key)
+        combo.setCurrentIndex(max(0, combo.findData(source or entry["preset_id"] or root)))
+        combo.blockSignals(False)
+        combo.setEnabled(True)
+        self._load_version()
+
+    def _load_version(self):
+        self._view_key = self.version_combo.currentData()
+        row = self._versions.get(self._view_key)
+        text = row["text"] if row else self._root_text
+        selected_job = row["job_id"] if row else self._original_job
+        self._selected = (selected_job, text) if selected_job else None
+        self._display(text)
+
+    def _change_version(self):
+        if self._artifact is None:
+            return
+        if self._dirty:
+            self.version_combo.blockSignals(True)
+            self.version_combo.setCurrentIndex(self.version_combo.findData(self._view_key))
+            self.version_combo.blockSignals(False)
+            self.show_notice("Save or discard the editor changes first.")
+            return
+        self._load_version()
+
+    def _text_changed(self):
+        was_dirty = self._dirty
+        self._dirty = self.text_edit.toPlainText() != self._base_text
+        if self._dirty and not was_dirty and self._artifact:
+            self.draft_started.emit(self._artifact)
+
+    def _discard_edit(self):
+        if self._artifact:
+            try:
+                self._open_entry(self._artifact, self._view_key)
+            except StaleAttempt:
+                self._plain_view("")
+                self.show_notice("Entry removed.")
+            except StorageError:
+                self.show_notice("Entry unavailable. Copy can recover your edit.")
+        else:
+            self._display(self._base_text)
+
+    def _save_edit(self):
+        if not self._artifact or not self._dirty:
+            self.show_notice("Select a saved entry and edit its text first.")
+            return
+        key = self._view_key if self._view_key in self._versions else "raw"
+        revision = self._versions.get(key, {}).get("revision", 0)
+        try:
+            self.history.edit(self._artifact, key, revision, self.text_edit.toPlainText(), self._view_key)
+            self._open_entry(self._artifact, key)
+            self.refresh_history()
+            self.show_notice("Edit saved.")
+        except (StorageError, ValueError):
+            self.show_notice("Edit not saved. Copy your draft or discard it to reload the saved revision.")
+
+    def _repeat(self):
+        if self._artifact and not self._dirty:
+            revision = self._versions.get(self._view_key, {}).get("revision", 0)
+            self.repeat_requested.emit(self._artifact, self._view_key, revision)
+        else:
+            self.show_notice("Select a saved version. Save or discard any editor changes first.")
 
     def add_transcription(self, outcome):
-        self._selected = (outcome.id, outcome.text) if outcome.error is None else None
-        self.text_edit.setPlainText(outcome.text)
         self.refresh_history()
+        if self._dirty or outcome.keep_editor or (outcome.artifact and self._artifact != outcome.artifact):
+            self.show_notice(outcome.message + (" Editor changes retained." if self._dirty else ""))
+            return
+        try:
+            if outcome.error:
+                self._plain_view(outcome.text)
+            else:
+                self._open_entry(outcome.artifact or outcome.id)
+        except StaleAttempt:
+            self.show_notice("Entry removed.")
+            return
+        except StorageError:
+            self._plain_view(outcome.text)
         self.show_notice(outcome.message)
 
     def _remove_card_widget(self, entry_id: str) -> None:
@@ -420,9 +569,16 @@ class MainWindow(QWidget):
             card.deleteLater()
 
     def _on_card_deleted(self, entry_id: str) -> None:
+        selected = entry_id == self._artifact
+        if selected and self._dirty and self.text_edit.toPlainText().strip():
+            self.show_notice("Save or discard the editor changes before deleting this entry.")
+            return
         try:
             self.history.remove(entry_id)
             self._remove_card_widget(entry_id)
+            if selected:
+                self._plain_view("")
+                self.show_notice("Entry removed.")
         except StorageError:
             self.show_notice("History change could not be saved.")
 
@@ -436,8 +592,14 @@ class MainWindow(QWidget):
 
     def _on_lm_toggled(self, checked: bool) -> None:
         self.settings.set("lm_studio", checked)
-        self.lm_cb.setEnabled(checked or self._lm_ready)
-        self.lm_toggle_requested.emit(checked)
+        self.presets.active.setCurrentIndex(self.presets.active.findData("strict" if checked else "raw"))
+
+    def _set_delivery(self):
+        mode = self.delivery_combo.currentData()
+        with self.selection.lock:
+            if mode == "artifact":
+                self.manual_delivery_requested.emit()
+            self.settings.set("delivery_mode", mode)
 
     def _on_ensure_clicked(self) -> None:
         """Refresh clicked: start the server and load a model in the background."""
@@ -501,7 +663,7 @@ class MainWindow(QWidget):
     def _show_lm_choice(self, ready):
         # Losing readiness cannot turn an opted-in Smart request into an automatic Raw paste.
         self._lm_ready = ready
-        requested = bool(self.settings.get("lm_studio", False))
+        requested = self.selection.active != "raw"
         self.lm_cb.blockSignals(True)
         self.lm_cb.setChecked(requested)
         self.lm_cb.setEnabled(ready or requested)
@@ -521,8 +683,10 @@ class MainWindow(QWidget):
                     return
                 if self._selected and self._selected[1] == text:
                     selected = self._selected[0]
-                    if self.history.copied(selected) and selected in self._cards:
-                        self._cards[selected].mark_copied()
+                    if self.history.copied(selected):
+                        card = self._cards.get(self._artifact)
+                        if card and card._entry.get("job_id") == selected:
+                            card.mark_copied()
                 self.show_notice("Copied to clipboard.")
             except StorageError:
                 self.show_notice("Copied to clipboard. Copy status could not be saved.")
